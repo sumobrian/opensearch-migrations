@@ -12,6 +12,7 @@ from kubernetes.client.rest import ApiException
 from ..models.utils import get_current_namespace, load_k8s_config
 from .artifact_store import ArtifactStoreError, artifact_uri, list_artifacts, read_artifact_text
 from .crd_utils import CRD_GROUP, CRD_VERSION, DISPLAY_NAMES, parse_resource_path, resource_display_name
+from .hints import hint_after_show
 from .log import (
     _split_passthrough_args,
 )
@@ -41,6 +42,14 @@ OUTPUT_ROOT = "migration-outputs"
 GATE_OUTPUT_TARGETS = {
     "evaluatemetadata": ("snapshotmigration", "metadataEvaluate"),
     "migratemetadata": ("snapshotmigration", "metadataMigrate"),
+}
+OUTPUT_TASK_BY_OUTPUT = {
+    task_info["output"]: task
+    for task, task_info in OUTPUT_TASKS.items()
+}
+OUTPUT_NAME_BY_LOWER = {
+    output_name.lower(): output_name
+    for output_name in OUTPUT_TASK_BY_OUTPUT
 }
 
 
@@ -101,6 +110,15 @@ def _canonical_task_name(value: Optional[str]) -> Optional[str]:
     if normalized in OUTPUT_TASKS or normalized in OUTPUT_TASK_ALIASES:
         return OUTPUT_TASK_ALIASES.get(normalized, normalized)
     return None
+
+
+def _output_name_from_task_or_output(value: Optional[str]) -> Optional[str]:
+    task = _canonical_task_name(value)
+    if task:
+        return OUTPUT_TASKS[task]["output"]
+    if not value:
+        return None
+    return OUTPUT_NAME_BY_LOWER.get(value.lower(), value)
 
 
 def _resolve_show_target(resource_name: str, output_name: Optional[str]) -> tuple[str, Optional[str]]:
@@ -176,23 +194,39 @@ def _tasks_with_current_outputs(namespace: str) -> List[str]:
     ]
 
 
-def _get_task_or_resource_completions(ctx, _, incomplete):
+def _resources_with_current_outputs(namespace: str) -> List[str]:
+    resources = {
+        resource_name
+        for task in OUTPUT_TASKS
+        for resource_name, _ in _list_resources_for_task(namespace, task)
+    }
+    return sorted(resources)
+
+
+def _get_resource_or_task_completions(ctx, _, incomplete):
     namespace = ctx.params.get("namespace", "ma")
     try:
         load_k8s_config()
         task_names = _tasks_with_current_outputs(namespace)
+        resource_names = _resources_with_current_outputs(namespace)
     except Exception:
         task_names = []
+        resource_names = []
 
-    return [name for name in task_names if name.startswith(incomplete)]
+    names = task_names + [name for name in resource_names if name not in task_names]
+    return [name for name in names if name.startswith(incomplete)]
+
+
+def _first_show_argument(ctx) -> Optional[str]:
+    return ctx.params.get("resource_name")
 
 
 def _get_resource_filter_completions(ctx, _, incomplete):
-    target = ctx.params.get("target")
-    task = _canonical_task_name(target)
+    resource_name = _first_show_argument(ctx)
+    task = _canonical_task_name(resource_name)
     namespace = ctx.params.get("namespace", "ma")
     if not task:
-        return _get_output_name_completions(ctx, _, incomplete)
+        return _get_task_name_completions_for_resource(ctx, _, incomplete)
     try:
         load_k8s_config()
         names = [name for name, _ in _list_resources_for_task(namespace, task)]
@@ -205,9 +239,10 @@ def _history_prefix(resource_name: str, resource: Dict[str, Any], output_name: s
     display_type = _resource_display_type(resource_name)
     parsed = parse_resource_path(resource_name)
     uid = _resource_uid(resource)
-    if not display_type or not parsed or not uid:
+    creation_ts = resource.get("metadata", {}).get("creationTimestamp", "")
+    if not display_type or not parsed or not uid or not creation_ts:
         return None
-    return f"{OUTPUT_ROOT}/{display_type}/{parsed[1]}/{uid}/{output_name}/"
+    return f"{OUTPUT_ROOT}/{display_type}/{parsed[1]}/{creation_ts}_{uid}/{output_name}/"
 
 
 def _iso_timestamp(value) -> str:
@@ -263,18 +298,26 @@ def _select_history_entry(entries: List[Dict[str, Any]], selector: str) -> Optio
     return None
 
 
-def _get_output_name_completions(ctx, _, incomplete):
-    resource_name = ctx.params.get("target")
+def _task_name_for_output_name(output_name: str) -> str:
+    task = OUTPUT_TASK_BY_OUTPUT.get(output_name)
+    if task:
+        return OUTPUT_TASKS[task]["display"]
+    return output_name
+
+
+def _get_task_name_completions_for_resource(ctx, _, incomplete):
+    resource_name = _first_show_argument(ctx)
     if not resource_name:
         return []
     namespace = ctx.params.get("namespace", "ma")
     try:
         load_k8s_config()
         resource = _fetch_resource(namespace, resource_name)
-        names = _output_refs(resource).keys()
+        output_names = _output_refs(resource).keys()
     except Exception:
-        names = _managed_output_names_for_resource(resource_name)
-    return [name for name in sorted(names) if name.startswith(incomplete)]
+        output_names = _managed_output_names_for_resource(resource_name)
+    names = sorted(_task_name_for_output_name(output_name) for output_name in output_names)
+    return [name for name in names if name.startswith(incomplete)]
 
 
 def _print_output_refs(ctx, refs: Dict[str, Dict[str, str]], clean: bool = False) -> None:
@@ -307,6 +350,31 @@ def _print_latest_outputs(ctx, targets: List[tuple[str, str, Dict[str, str]]],
         _print_output_refs(ctx, {output_name: ref}, clean=clean)
 
 
+def _all_current_output_targets(namespace: str) -> List[tuple[str, str, Dict[str, str]]]:
+    targets = []
+    seen = set()
+    for task_name, task_info in OUTPUT_TASKS.items():
+        output_name = task_info["output"]
+        for resource_name, resource in _list_resources_for_task(namespace, task_name):
+            ref = _output_refs(resource).get(output_name)
+            if not ref:
+                continue
+            key = (resource_name, output_name, ref.get("s3Key"))
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append((resource_name, output_name, ref))
+    return targets
+
+
+def _show_all_current_outputs(ctx, namespace: str, clean: bool = False) -> None:
+    targets = _all_current_output_targets(namespace)
+    if not targets:
+        click.echo("No managed workflow outputs found for current resources.")
+        return
+    _print_latest_outputs(ctx, targets, always_header=True, clean=clean)
+
+
 def _resource_matches_filter(resource_name: str, resource_filter: Optional[str]) -> bool:
     if not resource_filter:
         return True
@@ -322,21 +390,26 @@ def _task_resources(namespace: str, task: str,
 
 
 def _show_task_outputs(ctx, namespace: str, task: str, resource_filter: Optional[str],
-                       clean: bool = False) -> None:
+                       clean: bool = False) -> bool:
+    """Display a task's outputs across current resources. Returns True if output was shown."""
     task_info = OUTPUT_TASKS[task]
     output_name = task_info["output"]
     resources = _task_resources(namespace, task, resource_filter)
+    subject = f" matching '{resource_filter}'" if resource_filter else ""
     if not resources:
-        subject = f" matching '{resource_filter}'" if resource_filter else ""
         click.echo(f"No {task_info['display']} output found for current resources{subject}.")
-        return
+        return False
 
     targets = []
     for resource_name, resource in resources:
         ref = _output_refs(resource).get(output_name)
         if ref:
             targets.append((resource_name, output_name, ref))
+    if not targets:
+        click.echo(f"No {task_info['display']} output found for current resources{subject}.")
+        return False
     _print_latest_outputs(ctx, targets, always_header=True, clean=clean)
+    return True
 
 
 def _task_history_entries(namespace: str, task: str,
@@ -425,16 +498,17 @@ def _show_task_history(ctx, namespace: str, task: str,
     _print_history_or_run(ctx, entries, run_selector)
 
 
-def _handle_task_show(ctx, namespace: str, task: str, selector: Optional[str],
+def _handle_task_show(ctx, namespace: str, task: str, resource_filter: Optional[str],
                       list_resources: bool, history: bool,
-                      run_selector: Optional[str], clean: bool) -> None:
+                      run_selector: Optional[str], clean: bool) -> bool:
+    """Show a task's artifacts. Returns True if current output was displayed."""
     if list_resources:
         _list_show_targets(namespace, task)
-        return
+        return False
     if history or run_selector:
-        _show_task_history(ctx, namespace, task, selector, run_selector)
-        return
-    _show_task_outputs(ctx, namespace, task, selector, clean=clean)
+        _show_task_history(ctx, namespace, task, resource_filter, run_selector)
+        return False
+    return _show_task_outputs(ctx, namespace, task, resource_filter, clean=clean)
 
 
 def _fetch_resource_and_refs(
@@ -465,45 +539,81 @@ def _show_resource_history(ctx, resource_name: str, resource: Dict[str, Any],
 
 
 def _show_current_resource_outputs(ctx, resource_name: str, output_name: Optional[str],
-                                   refs: Dict[str, Dict[str, str]], clean: bool) -> None:
+                                   refs: Dict[str, Dict[str, str]], clean: bool) -> bool:
+    """Display current outputs for a resource. Returns True if output was shown."""
     if output_name:
         if output_name not in refs:
             available = ", ".join(sorted(refs)) or "none"
             click.echo(f"No managed output named '{output_name}' found for '{resource_name}'.")
             click.echo(f"Available outputs: {available}")
-            return
+            return False
         refs = {output_name: refs[output_name]}
 
     if not refs:
         expected = ", ".join(_managed_output_names_for_resource(resource_name))
         suffix = f" Expected outputs: {expected}." if expected else ""
         click.echo(f"No managed stdout output found for migration resource '{resource_name}'.{suffix}")
-        return
+        return False
 
     _print_output_refs(ctx, dict(sorted(refs.items())), clean=clean)
+    return True
 
 
-def _handle_resource_show(ctx, namespace: str, target: str, selector: Optional[str],
+def _handle_resource_show(ctx, namespace: str, resource_name_arg: str, task: Optional[str],
                           list_resources: bool, history: bool,
-                          run_selector: Optional[str], clean: bool) -> None:
+                          run_selector: Optional[str], clean: bool) -> bool:
+    """Show artifacts for a resource. Returns True if current output was displayed."""
     if list_resources and not _show_resource_list_error(ctx):
-        return
+        return False
 
-    resource_name, output_name = _resolve_show_target(target, selector)
+    resource_name, output_name = _resolve_show_target(
+        resource_name_arg,
+        _output_name_from_task_or_output(task),
+    )
     resource_and_refs = _fetch_resource_and_refs(ctx, namespace, resource_name)
     if not resource_and_refs:
-        return
+        return False
     resource, refs = resource_and_refs
 
     if history or run_selector:
         _show_resource_history(ctx, resource_name, resource, output_name, run_selector)
+        return False
+    return _show_current_resource_outputs(ctx, resource_name, output_name, refs, clean)
+
+
+def _list_all_show_targets_or_exit(ctx, namespace: str) -> None:
+    try:
+        load_k8s_config()
+        _list_show_targets(namespace, None)
+    except Exception as e:
+        click.echo(f"Error listing workflow outputs: {e}", err=True)
+        ctx.exit(1)
+
+
+def _handle_show_without_resource(ctx, list_resources: bool, all_resources: bool,
+                                  history: bool, run_selector: Optional[str],
+                                  clean: bool, namespace: str) -> None:
+    if all_resources and list_resources:
+        _exit_with_help(ctx, "Error: specify only one of --list or --all.")
         return
-    _show_current_resource_outputs(ctx, resource_name, output_name, refs, clean)
+    if all_resources and (history or run_selector):
+        _exit_with_help(ctx, "Error: --all shows current artifacts and cannot be used with --history or --run.")
+        return
+    if all_resources:
+        if _load_k8s_config_or_exit(ctx):
+            _show_all_current_outputs(ctx, namespace, clean=clean)
+        return
+    if list_resources:
+        _list_all_show_targets_or_exit(ctx, namespace)
+        return
+    click.echo(ctx.get_help())
 
 
 @click.command(name="show")
 @click.option('--list', 'list_resources', is_flag=True, default=False,
               help='List available migration resources and exit')
+@click.option('--all', 'all_resources', is_flag=True, default=False,
+              help='Show the latest output artifacts for all current resources')
 @click.option('--history', is_flag=True, default=False,
               help='List retained output artifacts for this resource UID')
 @click.option('--run', 'run_selector',
@@ -511,31 +621,32 @@ def _handle_resource_show(ctx, namespace: str, target: str, selector: Optional[s
 @click.option('--clean', is_flag=True, default=False,
               help='Print only output content, without section headers')
 @click.option('--namespace', default=get_current_namespace, hidden=True, envvar='WORKFLOW_NAMESPACE')
-@click.argument('target', required=False, shell_complete=_get_task_or_resource_completions)
-@click.argument('selector', required=False, shell_complete=_get_resource_filter_completions)
+@click.argument('resource_name', required=False, metavar='RESOURCE_NAME',
+                shell_complete=_get_resource_or_task_completions)
+@click.argument('task', required=False, metavar='TASK', shell_complete=_get_resource_filter_completions)
 @click.argument('extra_args', nargs=-1, type=click.UNPROCESSED)
 @click.pass_context
-def show_command(ctx, list_resources, history, run_selector, clean, namespace, target, selector, extra_args):
-    """Show managed stdout output for workflow tasks or resources.
+def show_command(ctx, list_resources, all_resources, history, run_selector, clean, namespace,
+                 resource_name, task, extra_args):
+    """Show the artifact output for workflow tasks on resources.
 
     \b
     Examples:
-      workflow show evaluatemetadata
+      workflow show --list
+      workflow show --all
+      workflow show snapshotmigration.migration-0 migratemetadata
+      workflow show snapshotmigration.migration-0 migratemetadata --history
+      workflow show snapshotmigration.migration-0 migratemetadata --run 2
       workflow show migratemetadata snapshotmigration.migration-0
-      workflow show evaluatemetadata.source-target-snap1-migration-0
-      workflow show snapshotmigration.migration-0 metadataMigrate --history
-      workflow show snapshotmigration.migration-0 metadataMigrate --run 2
     """
-    if target is None:
-        if list_resources:
-            try:
-                load_k8s_config()
-                _list_show_targets(namespace, None)
-            except Exception as e:
-                click.echo(f"Error listing workflow outputs: {e}", err=True)
-                ctx.exit(1)
-            return
-        _exit_with_help(ctx, "Error: specify a task, migration resource, or --list.")
+    if resource_name is None:
+        _handle_show_without_resource(
+            ctx, list_resources, all_resources, history, run_selector, clean, namespace
+        )
+        return
+
+    if all_resources:
+        _exit_with_help(ctx, "Error: --all does not accept a resource or task argument.")
         return
 
     before_dashdash, passthrough_args = _split_passthrough_args(extra_args)
@@ -546,9 +657,19 @@ def show_command(ctx, list_resources, history, run_selector, clean, namespace, t
     if not _load_k8s_config_or_exit(ctx):
         return
 
-    task = _canonical_task_name(target)
-    if task:
-        _handle_task_show(ctx, namespace, task, selector, list_resources, history, run_selector, clean)
-        return
+    output_task = _canonical_task_name(resource_name)
+    if output_task:
+        output_shown = _handle_task_show(
+            ctx, namespace, output_task, task, list_resources, history, run_selector, clean
+        )
+    else:
+        output_shown = _handle_resource_show(
+            ctx, namespace, resource_name, task, list_resources, history, run_selector, clean
+        )
 
-    _handle_resource_show(ctx, namespace, target, selector, list_resources, history, run_selector, clean)
+    # Only nudge toward the next step when output was actually displayed. Error paths
+    # exit, and no-output paths print their own explanatory message and return False, so a
+    # "migration complete" hint would contradict them. --clean is script-friendly raw
+    # output and must never carry the hint.
+    if output_shown and not list_resources and not history and not run_selector and not clean:
+        hint_after_show()

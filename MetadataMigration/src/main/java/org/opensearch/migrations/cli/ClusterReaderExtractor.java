@@ -5,12 +5,16 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import org.opensearch.migrations.Flavor;
 import org.opensearch.migrations.MigrateOrEvaluateArgs;
 import org.opensearch.migrations.Version;
 import org.opensearch.migrations.bulkload.common.FileSystemRepo;
+import org.opensearch.migrations.bulkload.common.GcsRepo;
+import org.opensearch.migrations.bulkload.common.GcsUri;
+import org.opensearch.migrations.bulkload.common.RepoUri;
 import org.opensearch.migrations.bulkload.common.S3Repo;
 import org.opensearch.migrations.bulkload.common.S3Uri;
 import org.opensearch.migrations.bulkload.common.SourceRepo;
@@ -32,17 +36,22 @@ public class ClusterReaderExtractor {
     private final MigrateOrEvaluateArgs arguments;
 
     public ClusterReader extractClusterReader() {
-        if (arguments.fileSystemRepoPath == null && arguments.s3RepoUri == null && arguments.sourceArgs.host == null) {
+        if (arguments.repoUri == null && arguments.sourceArgs.host == null) {
             throw new ParameterException("No details on the source cluster found, please supply a connection details or a snapshot");
         }
-        if ((arguments.s3RepoUri != null) && (arguments.s3Region == null || arguments.s3LocalDirPath == null)) {
-            throw new ParameterException("If an s3 repo is being used, s3-region and s3-local-dir-path must be set");
+
+        RepoUri parsedUri = arguments.repoUri != null ? RepoUri.parse(arguments.repoUri) : null;
+
+        if (parsedUri instanceof RepoUri.S3RepoUri && (arguments.s3Region == null || arguments.localDir == null)) {
+            throw new ParameterException("If an s3 repo is being used, --s3-region and --local-dir must be set");
+        }
+        if (parsedUri instanceof RepoUri.GcsRepoUri && arguments.localDir == null) {
+            throw new ParameterException("If a GCS repo is being used, --local-dir must be set");
         }
 
         // Solr backup: prefer snapshot over remote when snapshot args are provided
-        if (arguments.sourceVersion != null && arguments.sourceVersion.getFlavor() == Flavor.SOLR
-                && (arguments.fileSystemRepoPath != null || arguments.s3RepoUri != null)) {
-            return getSolrSnapshotReader();
+        if (arguments.sourceVersion != null && arguments.sourceVersion.getFlavor() == Flavor.SOLR && parsedUri != null) {
+            return getSolrSnapshotReader(parsedUri);
         }
 
         if (arguments.sourceArgs != null && arguments.sourceArgs.host != null) {
@@ -55,48 +64,67 @@ public class ClusterReaderExtractor {
 
         // Solr backup: read metadata from backup directory
         if (arguments.sourceVersion.getFlavor() == Flavor.SOLR) {
-            return getSolrSnapshotReader();
+            return getSolrSnapshotReader(parsedUri);
         }
 
         // ES/OS snapshot path
         var fileFinder = SnapshotReaderRegistry.getSnapshotFileFinder(arguments.sourceVersion, true);
 
-        SourceRepo repo = null;
-        if (arguments.fileSystemRepoPath != null) {
-            repo = new FileSystemRepo(Path.of(arguments.fileSystemRepoPath), fileFinder);
-        } else if (arguments.s3LocalDirPath != null) {
-            repo = S3Repo.create(
-                Path.of(arguments.s3LocalDirPath),
-                new S3Uri(arguments.s3RepoUri),
-                arguments.s3Region,
-                Optional.ofNullable(arguments.s3Endpoint).map(URI::create).orElse(null),
+        SourceRepo repo = switch (parsedUri) {
+            case RepoUri.FileRepoUri f -> new FileSystemRepo(Path.of(f.path()), fileFinder);
+            case RepoUri.GcsRepoUri g -> GcsRepo.create(
+                Path.of(arguments.localDir),
+                new GcsUri(g.rawUri()),
+                arguments.endpoint,
                 fileFinder
             );
-        } else {
-            throw new ParameterException("Unable to find valid resource provider");
-        }
+            case RepoUri.S3RepoUri s -> S3Repo.create(
+                Path.of(arguments.localDir),
+                s.s3Uri(),
+                arguments.s3Region,
+                Optional.ofNullable(arguments.endpoint).map(URI::create).orElse(null),
+                fileFinder
+            );
+            case null -> throw new ParameterException("Unable to find valid resource provider");
+        };
 
         return getSnapshotReader(arguments.sourceVersion, repo);
     }
 
-    private ClusterReader getSolrSnapshotReader() {
+    private ClusterReader getSolrSnapshotReader(RepoUri parsedUri) {
         Path backupDir;
         List<String> collectionNames;
-        if (arguments.fileSystemRepoPath != null) {
-            backupDir = Path.of(arguments.fileSystemRepoPath);
-            collectionNames = discoverFileSystemCollections(backupDir);
-        } else if (arguments.s3LocalDirPath != null) {
-            var s3Repo = createSolrS3Repo();
-            backupDir = s3Repo.getRepoRootDir();
-            collectionNames = s3Repo.listTopLevelDirectories();
-            for (var collection : collectionNames) {
-                downloadZkBackupForCollection(s3Repo, collection);
+        var dataDirByCollection = new LinkedHashMap<String, String>();
+        switch (parsedUri) {
+            case RepoUri.FileRepoUri f -> {
+                backupDir = Path.of(f.path());
+                var bare = SolrBackupLayout.classifyBareBackup(backupDir);
+                if (bare != null && bare.collectionName() != null) {
+                    collectionNames = List.of(bare.collectionName());
+                    dataDirByCollection.put(bare.collectionName(), bare.dataPath());
+                } else {
+                    collectionNames = discoverFileSystemCollections(backupDir);
+                }
             }
-        } else {
-            throw new ParameterException("Solr snapshot requires --file-system-repo-path or S3 args");
+            case RepoUri.S3RepoUri s -> {
+                var s3Repo = createSolrS3Repo(s);
+                backupDir = s3Repo.getRepoRootDir();
+                var bare = s3Repo.detectBareSolrLayout();
+                if (bare != null && bare.collectionName() != null) {
+                    collectionNames = List.of(bare.collectionName());
+                    dataDirByCollection.put(bare.collectionName(), bare.dataPath());
+                    downloadZkBackupForDataDir(s3Repo, bare.dataPath());
+                } else {
+                    collectionNames = s3Repo.listTopLevelDirectories();
+                    for (var collection : collectionNames) {
+                        downloadZkBackupForCollection(s3Repo, collection);
+                    }
+                }
+            }
+            default -> throw new ParameterException("Solr snapshot requires --repo-uri with file:// or s3:// scheme");
         }
 
-        return buildSolrSnapshotReader(backupDir, collectionNames);
+        return buildSolrSnapshotReader(backupDir, collectionNames, dataDirByCollection);
     }
 
     private List<String> discoverFileSystemCollections(Path backupDir) {
@@ -107,18 +135,15 @@ public class ClusterReaderExtractor {
         }
     }
 
-    private S3Repo createSolrS3Repo() {
-        // Solr's BACKUP API writes to <location>/<snapshotName>/ where <location> is
-        // the path portion of s3RepoUri (or / when no subpath is configured).
-        var repoUri = new S3Uri(arguments.s3RepoUri);
+    private S3Repo createSolrS3Repo(RepoUri.S3RepoUri s3RepoUri) {
         var backupS3Uri = arguments.snapshotName != null
-            ? SolrBackupLayout.buildBackupS3Uri(repoUri, arguments.snapshotName)
-            : arguments.s3RepoUri;
+            ? SolrBackupLayout.buildBackupS3Uri(s3RepoUri.s3Uri(), arguments.snapshotName)
+            : s3RepoUri.rawUri();
         return S3Repo.createRaw(
-            Path.of(arguments.s3LocalDirPath),
+            Path.of(arguments.localDir),
             new S3Uri(backupS3Uri),
             arguments.s3Region,
-            Optional.ofNullable(arguments.s3Endpoint).map(URI::create).orElse(null)
+            Optional.ofNullable(arguments.endpoint).map(URI::create).orElse(null)
         );
     }
 
@@ -132,7 +157,7 @@ public class ClusterReaderExtractor {
      *
      * Delegates layout resolution to {@link SolrBackupLayout#resolveCollectionDataPrefix}.
      */
-    private void downloadZkBackupForCollection(S3Repo s3Repo, String collection) {
+    void downloadZkBackupForCollection(S3Repo s3Repo, String collection) {
         var resolved = SolrBackupLayout.resolveCollectionDataPrefix(collection, s3Repo::listSubDirectories);
         if (resolved == null) {
             log.warn("No zk_backup directories found for collection '{}' in S3", collection);
@@ -141,10 +166,22 @@ public class ClusterReaderExtractor {
         s3Repo.downloadPrefix(resolved.joinWith(collection) + "/" + resolved.latestZkBackupName());
     }
 
-    private ClusterReader buildSolrSnapshotReader(Path backupDir, List<String> collectionNames) {
+    void downloadZkBackupForDataDir(S3Repo s3Repo, String dataDir) {
+        var zkName = SolrBackupLayout.findLatestZkBackupName(s3Repo.listSubDirectories(dataDir));
+        if (zkName == null) {
+            log.warn("No zk_backup found at bare Solr backup root '{}'", dataDir);
+            return;
+        }
+        s3Repo.downloadPrefix(SolrBackupLayout.joinPrefix(dataDir, zkName));
+    }
+
+    private ClusterReader buildSolrSnapshotReader(
+        Path backupDir, List<String> collectionNames, Map<String, String> dataDirByCollection
+    ) {
         var schemas = new LinkedHashMap<String, JsonNode>();
         for (var name : collectionNames) {
-            schemas.put(name, SolrSchemaXmlParser.findAndParse(backupDir.resolve(name)));
+            var dataDir = dataDirByCollection.getOrDefault(name, name);
+            schemas.put(name, SolrSchemaXmlParser.findAndParse(backupDir.resolve(dataDir)));
         }
 
         if (!arguments.dataFilterArgs.indexAllowlist.isEmpty()) {
@@ -152,7 +189,7 @@ public class ClusterReaderExtractor {
         }
 
         log.atInfo().setMessage("Solr snapshot reader: found {} collection(s) in {}").addArgument(schemas.size()).addArgument(backupDir).log();
-        return new SolrSnapshotReader(arguments.sourceVersion, backupDir, schemas);
+        return new SolrSnapshotReader(arguments.sourceVersion, backupDir, schemas, dataDirByCollection);
     }
 
     ClusterReader getRemoteReader(ConnectionContext connection) {

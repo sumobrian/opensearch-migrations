@@ -6,6 +6,11 @@ Teardown ordering belongs in **Kubernetes**, not Argo. Argo exit handlers don't 
 
 ## Architecture
 
+For how workflow configuration is projected into these migration CR specs, and
+how the matching CRDs and ValidatingAdmissionPolicies are generated and staged,
+see
+[resolvingMigrationParametersFromConfigs.md](resolvingMigrationParametersFromConfigs.md).
+
 ### The ownership graph (set up at creation time in orchestration specs)
 
 Ownership is **chained** so that dependents die before their dependencies. This
@@ -122,6 +127,14 @@ Resources declare dependencies via `spec.dependsOn` on their CRDs. The CLI
 builds a DAG and deletes in dependency-safe order: a resource is only deleted
 after all its dependents are gone. Independent branches proceed in parallel.
 
+All migration resources populate `spec.dependsOn`, including the terminal
+`DataSnapshot` and `SnapshotMigration` (a DataSnapshot points at its proxy setups; a
+SnapshotMigration points at its DataSnapshot, or nothing for an externally-managed ES/OS
+snapshot). The workflow's `tryApply` step is the sole writer of this field on the live CR;
+the initializer intentionally omits it from the terminal-resource bootstrap spec so the
+graph reflects only edges the workflow has actually established (see
+[reconfiguringWorkflows.md](reconfiguringWorkflows.md)).
+
 ### Relationship to workflow submission
 
 Reset does **not** stop or delete the Argo workflow. It only deletes migration
@@ -140,9 +153,17 @@ Submit replaces any existing Argo workflow before creating a new one. It does
 
 The initializer runs before each submission to:
 1. Clean up stale ApprovalGate CRs (label-based deletion + per-name fallback)
-2. Create fresh CRD resources
+2. Create or reuse migration CRD resources, including one immutable `MigrationRun`
+   history record for the submitted run
 3. Enrich the workflow config with server-assigned CR UIDs
-4. Submit the Argo workflow
+4. Submit the Argo workflow with workflow-name/run-number labels and a
+   MigrationRun-name annotation
+
+After the Argo workflow starts, its first bookkeeping step, `initializeRunMetadata`,
+patches the matching `MigrationRun` with `status.workflowUid`,
+`status.workflowCreationTimestamp`, and a one-time workflow UID label. That keeps
+the durable run history inside Kubernetes without relying on the submitting shell
+process to survive after `kubectl create`.
 
 ---
 
@@ -162,3 +183,4 @@ Finalizers require a controller to remove them. We'd need either the Argo workfl
 | SnapshotMigration | snapshotmigrations | Coordinator StatefulSet + Service + Secret, RFS Deployment |
 | TrafficReplay | trafficreplays | Replayer Deployment |
 | ApprovalGate | approvalgates | (none — approval mechanism) |
+| MigrationRun | migrationruns | (none — immutable run history) |

@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from unittest.mock import MagicMock, patch
 
+from console_link.workflow.tree_utils import APPROVAL_TEMPLATE_NAME
 from console_link.workflow.tui.workflow_manage_app import (
     WorkflowTreeApp,
     copy_to_clipboard, PHASE_SUCCEEDED, PHASE_RUNNING
@@ -34,6 +35,7 @@ def mock_workflow_with_two_pods() -> dict[str, Any]:
     return {
         "metadata": {"name": "test-wf", "resourceVersion": "123"},
         "status": {
+            "phase": PHASE_RUNNING,
             "startedAt": "2023-01-01T00:00:00Z",
             "nodes": {
                 "node-1": {"id": "node-1", "displayName": "step-1", "type": "Pod", "phase": "Failed",
@@ -52,6 +54,7 @@ def mock_workflow_with_pod_and_suspend():
     return {
         "metadata": {"name": "test-wf", "resourceVersion": "123"},
         "status": {
+            "phase": PHASE_RUNNING,
             "startedAt": "2023-01-01T00:00:00Z",
             "nodes": {
                 "node-1": {"id": "node-1", "displayName": "step-1", "type": "Pod",
@@ -63,7 +66,7 @@ def mock_workflow_with_pod_and_suspend():
                                  "inputs": {"parameters": [{"name": "resourceName", "value": "migration-0"}]}},
                 "node-2": {"id": "node-2", "displayName": "suspend-1", "type": "Resource", "phase": PHASE_RUNNING,
                            "children": [],
-                           "templateRef": {"name": "resource-management", "template": "waitforapproval"},
+                           "templateRef": {"name": "resource-management", "template": APPROVAL_TEMPLATE_NAME},
                            "inputs": {"parameters": [{"name": "resourceName", "value": "my-gate"}]}}
             }
         }
@@ -152,7 +155,7 @@ async def test_waiter_loop_and_rediscovery(mock_workflow_with_two_pods):
         mock_waiter.trigger.reset_mock()
 
         assert await wait_until(pilot, lambda: "Waiting for Workflow" in get_clean_text_label(tree.root))
-        assert mock_waiter.trigger.call_count >= 1
+        assert await wait_until(pilot, lambda: mock_waiter.trigger.call_count >= 1)
 
 
 @pytest.mark.asyncio
@@ -237,6 +240,24 @@ async def test_functional_keybindings_execution(mock_workflow_with_pod_and_suspe
         await pilot.pause()
 
         argo_service.approve_step.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_tracks_last_known_workflow_phase(mock_workflow_with_two_pods):
+    argo_service = MagicMock(spec=ArgoService(None, None))
+    argo_service.get_workflow.return_value = ({"success": True}, mock_workflow_with_two_pods)
+
+    app = WorkflowTreeApp(
+        namespace="default",
+        name="test-wf",
+        argo_service=argo_service,
+        pod_scraper=MagicMock(spec=PodScraperInterface(None, None, None)),
+        workflow_waiter=FAILING_WAITER,
+        refresh_interval=100.0
+    )
+
+    async with app.run_test() as pilot:
+        assert await wait_until(pilot, lambda: app.last_known_phase == PHASE_RUNNING, timeout=5.0)
 
 
 @pytest.mark.asyncio

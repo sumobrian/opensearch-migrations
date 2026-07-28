@@ -3,35 +3,54 @@ import {
     AllowLiteralOrExpression,
     BaseExpression,
     expr,
+    ExpressionType,
+    FunctionExpression,
     INTERNAL,
     InputParamDef,
     InputParametersRecord,
     makeDirectTypeProxy,
     makeStringTypeProxy,
+    NonSerializedPlainObject,
     selectInputsForRegister,
     Serialized,
     TemplateBuilder,
+    ToJsonExpression,
     typeToken,
+    UnquotedTypeWrapper,
     WorkflowAndTemplatesScope,
     WorkflowBuilder
 } from '@opensearch-migrations/argo-workflow-builders';
 import {
-    ARGO_PROXY_WORKFLOW_OPTION_KEYS,
+    ARGO_PROXY_CR_OMITTED_KEYS,
     ARGO_REPLAYER_OPTIONS,
     ARGO_REPLAYER_WORKFLOW_OPTION_KEYS,
+    CLUSTER_CONNECTION_IDENTITY,
+    DEFAULT_RESOURCES,
     DENORMALIZED_PROXY_CONFIG,
+    DENORMALIZED_PROXY_SETUP_CONFIG,
+    NAMED_KAFKA_CLIENT_CONFIG,
     NAMED_KAFKA_CLUSTER_CONFIG,
     PER_SOURCE_CREATE_SNAPSHOTS_CONFIG,
     SNAPSHOT_MIGRATION_CONFIG,
 } from '@opensearch-migrations/schemas';
-import {CommonWorkflowParameters} from "./commonUtils/workflowParameters";
+import {CommonWorkflowParameters, workflowScriptCommand, workflowScriptRootEnvVars} from "./commonUtils/workflowParameters";
 import {makeRequiredImageParametersForKeys} from "./commonUtils/imageDefinitions";
-import {K8S_RESOURCE_RETRY_STRATEGY} from "./commonUtils/resourceRetryStrategy";
+import {
+    KAFKA_CLUSTER_READY_TIMEOUT_SECONDS,
+    KAFKA_READY_WAIT_POD_RETRY_STRATEGY,
+    K8S_INFRA_READY_RETRY_STRATEGY,
+    K8S_INFRA_READY_TIMEOUT_SECONDS,
+    K8S_RESOURCE_RETRY_STRATEGY,
+    K8S_INDEFINITE_RESOURCE_WAIT_RETRY_STRATEGY,
+    K8S_SECRET_READY_RETRY_STRATEGY,
+    K8S_USER_APPROVAL_WAIT_RETRY_STRATEGY,
+} from "./commonUtils/resourceRetryStrategy";
+import {prefixedScalableWorkloadFields, scalingFromRecord} from "./commonUtils/scalableWorkload";
 
-const SECONDS_IN_DAYS = 24 * 3600;
-const LONGEST_POSSIBLE_MIGRATION = 365 * SECONDS_IN_DAYS;
 const CRD_API_VERSION = "migrations.opensearch.org/v1alpha1";
-const RUN_UID_LABEL = "workflows.argoproj.io/run-uid";
+const RUN_NUMBER_LABEL = "migrations.opensearch.org/run-number";
+const APPROVED_DURING_RUN_ANNOTATION = "migrations.opensearch.org/approved-during-run";
+const MIGRATION_RUN_NUMBER_VALUE = "{{workflow.parameters.migrationRunNumber}}";
 const WORKFLOW_LABEL = "workflows.argoproj.io/workflow";
 const SOURCE_LABEL = "migrations.opensearch.org/source";
 const TARGET_LABEL = "migrations.opensearch.org/target";
@@ -40,6 +59,7 @@ const MIGRATION_LABEL = "migrations.opensearch.org/from-snapshot-migration";
 const TASK_LABEL = "migrations.opensearch.org/task";
 const KAFKA_CLUSTER_LABEL = "migrations.opensearch.org/kafka-cluster";
 const STRIMZI_CLUSTER_LABEL = "strimzi.io/cluster";
+const KAFKA_READY_WAIT_ACTIVE_DEADLINE_SECONDS = KAFKA_CLUSTER_READY_TIMEOUT_SECONDS + 60;
 
 type ReservedPatchInputNames = "resourceName" | "phase";
 type StringStatusFields = Readonly<Record<string, AllowLiteralOrExpression<string>>>;
@@ -68,6 +88,22 @@ function placeholderStatusFields<T extends StringStatusFields>(fields: T): Recor
         proxied[String(key)] = `{{inputs.parameters.${String(key)}}}`;
     }
     return proxied;
+}
+
+function makeYamlJsonLiteralProxy<T extends NonSerializedPlainObject>(value: BaseExpression<T, ExpressionType>): T {
+    // Resource templates substitute Argo expressions before kubectl parses the YAML.
+    // toJSON keeps quote-heavy strings, arrays, and objects valid as YAML literals.
+    const jsonExpression = new FunctionExpression<
+        Serialized<T>,
+        T,
+        ExpressionType,
+        "complicatedExpression",
+        readonly [BaseExpression<T, ExpressionType>]
+    >(
+        "toJSON",
+        [value] as const
+    ) as unknown as ToJsonExpression<Serialized<T>, "complicatedExpression">;
+    return new UnquotedTypeWrapper<T>(jsonExpression, "yaml-safe-json") as never;
 }
 
 function buildPatchStatusTemplate<
@@ -131,7 +167,7 @@ function buildPatchOutputTemplate<ParentWorkflowScope extends WorkflowAndTemplat
                                 s3Key: "{{inputs.parameters.s3Key}}",
                                 resourceUid: "{{inputs.parameters.resourceUid}}",
                                 workflowName: "{{workflow.name}}",
-                                workflowUid: "{{workflow.uid}}",
+                                migrationRunNumber: MIGRATION_RUN_NUMBER_VALUE,
                                 workflowCreationTimestamp: "{{workflow.creationTimestamp}}",
                                 configChecksum: "{{inputs.parameters.configChecksum}}"
                             }
@@ -154,13 +190,15 @@ function makeKafkaClusterManifest(
             name: makeStringTypeProxy(expr.get(kc, "name")),
             labels: {
                 [WORKFLOW_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("name")),
-                [RUN_UID_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("uid")),
+                [RUN_NUMBER_LABEL]: MIGRATION_RUN_NUMBER_VALUE,
                 [STRIMZI_CLUSTER_LABEL]: makeStringTypeProxy(expr.get(kc, "name")),
             }
         },
         spec: {
             dependsOn: [],
             version: makeStringTypeProxy(expr.get(kc, "version")),
+            clusterSpecOverrides: makeDirectTypeProxy(expr.dig(config, ["clusterSpecOverrides"], expr.makeDict({}))),
+            nodePoolSpecOverrides: makeDirectTypeProxy(expr.dig(config, ["nodePoolSpecOverrides"], expr.makeDict({}))),
             auth: {
                 type: makeStringTypeProxy(expr.dig(config, ["auth", "type"], "none")),
             },
@@ -191,12 +229,16 @@ function makeKafkaClusterManifest(
 function makeCapturedTrafficManifest(
     topicCrName: BaseExpression<string>,
     kafkaClusterName: BaseExpression<string>,
+    kafkaConfig: BaseExpression<Serialized<z.infer<typeof NAMED_KAFKA_CLIENT_CONFIG>>>,
     kafkaTopicName: BaseExpression<string>,
     sourceLabel: BaseExpression<string>,
     partitions: BaseExpression<Serialized<number>>,
     replicas: BaseExpression<Serialized<number>>,
     topicConfig: BaseExpression<Serialized<Record<string, any>>>,
+    sourceKind: BaseExpression<string>,
+    s3SourceUri: BaseExpression<string>,
 ) {
+    const kafkaIdentity = expr.deserializeRecord(kafkaConfig);
     return {
         apiVersion: CRD_API_VERSION,
         kind: "CapturedTraffic",
@@ -204,38 +246,69 @@ function makeCapturedTrafficManifest(
             name: makeStringTypeProxy(topicCrName),
             labels: {
                 [WORKFLOW_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("name")),
-                [RUN_UID_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("uid")),
+                [RUN_NUMBER_LABEL]: MIGRATION_RUN_NUMBER_VALUE,
                 [SOURCE_LABEL]: makeStringTypeProxy(sourceLabel),
                 [KAFKA_CLUSTER_LABEL]: makeStringTypeProxy(kafkaClusterName),
             }
         },
+        // s3SourceUri + sourceKind + loadStarted are routed through `apply` so
+        // that any change between submit attempts (e.g., user edits the URI in
+        // their config and resubmits) is caught by the CapturedTraffic VAP
+        // before any loader runs. The VAP rejects mutating s3SourceUri /
+        // sourceKind, so a resubmit pointed at a different file fails fast at
+        // admission, not after the loader pod has started writing partial data.
         spec: {
             dependsOn: [makeStringTypeProxy(kafkaClusterName)],
             kafkaClusterName: makeStringTypeProxy(kafkaClusterName),
+            kafkaBrokers: makeStringTypeProxy(expr.dig(kafkaIdentity, ["kafkaConnection"], expr.literal(""))),
+            kafkaManagedByWorkflow: makeDirectTypeProxy(expr.dig(kafkaIdentity, ["managedByWorkflow"], false)),
+            kafkaAuthType: makeStringTypeProxy(expr.dig(kafkaIdentity, ["authType"], expr.literal("none"))),
+            kafkaEnableMSKAuth: makeDirectTypeProxy(expr.dig(kafkaIdentity, ["enableMSKAuth"], false)),
+            kafkaSecretName: makeStringTypeProxy(expr.dig(kafkaIdentity, ["secretName"], expr.literal(""))),
+            kafkaCaSecretName: makeStringTypeProxy(expr.dig(kafkaIdentity, ["caSecretName"], expr.literal(""))),
+            kafkaUserName: makeStringTypeProxy(expr.dig(kafkaIdentity, ["kafkaUserName"], expr.literal(""))),
             topicName: makeStringTypeProxy(kafkaTopicName),
             partitions: makeDirectTypeProxy(partitions),
             replicas: makeDirectTypeProxy(replicas),
             topicConfig: makeDirectTypeProxy(expr.deserializeRecord(topicConfig)),
+            sourceLabel: makeStringTypeProxy(sourceLabel),
+            sourceKind: makeStringTypeProxy(sourceKind),
+            s3SourceUri: makeStringTypeProxy(s3SourceUri),
+            loadStarted: true,
         }
     };
 }
 
 function makeCaptureProxyManifest(
-    proxyConfig: BaseExpression<Serialized<z.infer<typeof DENORMALIZED_PROXY_CONFIG>>>,
+    proxyConfig: BaseExpression<Serialized<z.infer<typeof DENORMALIZED_PROXY_SETUP_CONFIG>>>,
     proxyName: BaseExpression<string>,
     topicCrName: BaseExpression<string>,
 ) {
     const config = expr.deserializeRecord(proxyConfig);
     const proxyOpts = expr.get(config, "proxyConfig");
+    const sourceIdentity = expr.get(config, "sourceConnectionIdentity");
+    const proxyScaling = scalingFromRecord(proxyOpts);
     const workflowSpecFields = expr.makeDict({
         dependsOn: expr.toArray(topicCrName),
+        sourceLabel: expr.dig(sourceIdentity, ["label"], expr.literal("")),
+        sourceVersion: expr.dig(sourceIdentity, ["version"], expr.literal("")),
+        sourceEndpoint: expr.dig(sourceIdentity, ["endpoint"], expr.literal("")),
+        sourceAllowInsecure: expr.dig(sourceIdentity, ["allowInsecure"], false),
+        sourceAuthType: expr.dig(sourceIdentity, ["authType"], expr.literal("none")),
+        sourceAuthBasicSecretName: expr.dig(sourceIdentity, ["authBasicSecretName"], expr.literal("")),
+        sourceAuthSigv4Region: expr.dig(sourceIdentity, ["authSigv4Region"], expr.literal("")),
+        sourceAuthSigv4Service: expr.dig(sourceIdentity, ["authSigv4Service"], expr.literal("")),
+        sourceAuthMtlsClientSecretName: expr.dig(sourceIdentity, ["authMtlsClientSecretName"], expr.literal("")),
+        sourceAuthMtlsCaCertHash: expr.dig(sourceIdentity, ["authMtlsCaCertHash"], expr.literal("")),
         loggingConfigurationOverrideConfigMap: expr.dig(
             proxyOpts,
             ["loggingConfigurationOverrideConfigMap"],
             expr.literal("")
         ),
+        serviceType: expr.dig(proxyOpts, ["serviceType"], expr.literal("LoadBalancer")),
         internetFacing: expr.dig(proxyOpts, ["internetFacing"], false),
-        podReplicas: expr.dig(proxyOpts, ["podReplicas"], 1),
+        podReplicas: proxyScaling.podReplicas,
+        minPodReplicas: proxyScaling.minPodReplicas,
         resources: expr.get(proxyOpts, "resources"),
         tls: expr.dig(proxyOpts, ["tls"], expr.makeDict({})),
     });
@@ -246,14 +319,14 @@ function makeCaptureProxyManifest(
             name: makeStringTypeProxy(proxyName),
             labels: {
                 [WORKFLOW_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("name")),
-                [RUN_UID_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("uid")),
+                [RUN_NUMBER_LABEL]: MIGRATION_RUN_NUMBER_VALUE,
                 [SOURCE_LABEL]: makeStringTypeProxy(expr.dig(config, ["sourceConfig", "label"], "")),
                 [TASK_LABEL]: "captureProxy",
             }
         },
         spec: makeDirectTypeProxy(expr.mergeDicts(
             workflowSpecFields,
-            expr.omit(proxyOpts, ...ARGO_PROXY_WORKFLOW_OPTION_KEYS)
+            expr.omit(proxyOpts, ...ARGO_PROXY_CR_OMITTED_KEYS)
         )),
     };
 }
@@ -263,6 +336,25 @@ function makeSnapshotMigrationManifest(
     snapshotMigrationConfig: BaseExpression<Serialized<z.infer<typeof SNAPSHOT_MIGRATION_CONFIG>>>,
 ) {
     const config = expr.deserializeRecord(snapshotMigrationConfig);
+    const documentBackfillScaling = prefixedScalableWorkloadFields(
+        "documentBackfill",
+        expr.dig(config, ["documentBackfillConfig"], expr.makeDict({}))
+    );
+    const sourceIdentity = expr.get(config, "sourceConnectionIdentity");
+    const targetIdentity = expr.get(config, "targetConnectionIdentity");
+    const snapshotNameResolution = expr.get(config, "snapshotNameResolution");
+    const snapshotRepo = expr.dig(config, ["snapshotConfig", "repoConfig"], expr.makeDict({}));
+    const hasDataSnapshotResource = expr.hasKey(snapshotNameResolution, "dataSnapshotResourceName");
+    const hasExternalSnapshotName = expr.hasKey(snapshotNameResolution, "externalSnapshotName");
+    const snapshotSourceType = expr.ternary(
+        hasDataSnapshotResource,
+        expr.ternary(
+            hasExternalSnapshotName,
+            expr.literal("externalPrepared"),
+            expr.literal("dataSnapshot")
+        ),
+        expr.literal("external")
+    );
     return {
         apiVersion: CRD_API_VERSION,
         kind: "SnapshotMigration",
@@ -270,7 +362,7 @@ function makeSnapshotMigrationManifest(
             name: makeStringTypeProxy(resourceName),
             labels: {
                 [WORKFLOW_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("name")),
-                [RUN_UID_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("uid")),
+                [RUN_NUMBER_LABEL]: MIGRATION_RUN_NUMBER_VALUE,
                 [SOURCE_LABEL]: makeStringTypeProxy(expr.get(config, "sourceLabel")),
                 [TARGET_LABEL]: makeStringTypeProxy(expr.dig(config, ["targetConfig", "label"], expr.literal(""))),
                 [SNAPSHOT_LABEL]: makeStringTypeProxy(expr.dig(config, ["snapshotConfig", "label"], expr.literal(""))),
@@ -278,11 +370,68 @@ function makeSnapshotMigrationManifest(
             }
         },
         spec: {
+            // Written by tryApply so the live CR carries its reset-DAG edge (workflow reset reads
+            // spec.dependsOn). A SnapshotMigration depends on its DataSnapshot when one exists; an
+            // externally-managed ES/OS snapshot with no DataSnapshot has no upstream CR edge.
+            dependsOn: makeDirectTypeProxy(expr.ternary(
+                hasDataSnapshotResource,
+                expr.toArray(expr.dig(snapshotNameResolution, ["dataSnapshotResourceName"], expr.literal(""))),
+                expr.literal([])
+            )),
             migrationLabel: makeStringTypeProxy(expr.get(config, "migrationLabel")),
-            sourceVersion: makeStringTypeProxy(expr.get(config, "sourceVersion")),
-            sourceLabel: makeStringTypeProxy(expr.get(config, "sourceLabel")),
-            targetLabel: makeStringTypeProxy(expr.dig(config, ["targetConfig", "label"], expr.literal(""))),
+            sourceVersion: makeStringTypeProxy(expr.dig(sourceIdentity, ["version"], expr.literal(""))),
+            sourceLabel: makeStringTypeProxy(expr.dig(sourceIdentity, ["label"], expr.literal(""))),
+            sourceEndpoint: makeStringTypeProxy(expr.dig(sourceIdentity, ["endpoint"], expr.literal(""))),
+            sourceAllowInsecure: makeDirectTypeProxy(expr.dig(sourceIdentity, ["allowInsecure"], false)),
+            sourceAuthType: makeStringTypeProxy(expr.dig(sourceIdentity, ["authType"], expr.literal("none"))),
+            sourceAuthBasicSecretName: makeStringTypeProxy(
+                expr.dig(sourceIdentity, ["authBasicSecretName"], expr.literal(""))
+            ),
+            sourceAuthSigv4Region: makeStringTypeProxy(
+                expr.dig(sourceIdentity, ["authSigv4Region"], expr.literal(""))
+            ),
+            sourceAuthSigv4Service: makeStringTypeProxy(
+                expr.dig(sourceIdentity, ["authSigv4Service"], expr.literal(""))
+            ),
+            sourceAuthMtlsClientSecretName: makeStringTypeProxy(
+                expr.dig(sourceIdentity, ["authMtlsClientSecretName"], expr.literal(""))
+            ),
+            sourceAuthMtlsCaCertHash: makeStringTypeProxy(
+                expr.dig(sourceIdentity, ["authMtlsCaCertHash"], expr.literal(""))
+            ),
+            targetLabel: makeStringTypeProxy(expr.dig(targetIdentity, ["label"], expr.literal(""))),
+            targetEndpoint: makeStringTypeProxy(expr.dig(targetIdentity, ["endpoint"], expr.literal(""))),
+            targetAllowInsecure: makeDirectTypeProxy(expr.dig(targetIdentity, ["allowInsecure"], false)),
+            targetAuthType: makeStringTypeProxy(expr.dig(targetIdentity, ["authType"], expr.literal("none"))),
+            targetAuthBasicSecretName: makeStringTypeProxy(
+                expr.dig(targetIdentity, ["authBasicSecretName"], expr.literal(""))
+            ),
+            targetAuthSigv4Region: makeStringTypeProxy(
+                expr.dig(targetIdentity, ["authSigv4Region"], expr.literal(""))
+            ),
+            targetAuthSigv4Service: makeStringTypeProxy(
+                expr.dig(targetIdentity, ["authSigv4Service"], expr.literal(""))
+            ),
+            targetAuthMtlsClientSecretName: makeStringTypeProxy(
+                expr.dig(targetIdentity, ["authMtlsClientSecretName"], expr.literal(""))
+            ),
+            targetAuthMtlsCaCertHash: makeStringTypeProxy(
+                expr.dig(targetIdentity, ["authMtlsCaCertHash"], expr.literal(""))
+            ),
             snapshotLabel: makeStringTypeProxy(expr.dig(config, ["snapshotConfig", "label"], expr.literal(""))),
+            snapshotSourceType: makeStringTypeProxy(snapshotSourceType),
+            dataSnapshotResourceName: makeStringTypeProxy(
+                expr.dig(snapshotNameResolution, ["dataSnapshotResourceName"], expr.literal(""))
+            ),
+            externalSnapshotName: makeStringTypeProxy(
+                expr.dig(snapshotNameResolution, ["externalSnapshotName"], expr.literal(""))
+            ),
+            snapshotRepoName: makeStringTypeProxy(expr.dig(snapshotRepo, ["repoName"], expr.literal(""))),
+            snapshotRepoPathUri: makeStringTypeProxy(expr.dig(snapshotRepo, ["repoPathUri"], expr.literal(""))),
+            snapshotRepoAwsRegion: makeStringTypeProxy(expr.dig(snapshotRepo, ["awsRegion"], expr.literal(""))),
+            snapshotRepoEndpoint: makeStringTypeProxy(expr.dig(snapshotRepo, ["endpoint"], expr.literal(""))),
+            snapshotRepoS3RoleArn: makeStringTypeProxy(expr.dig(snapshotRepo, ["s3RoleArn"], expr.literal(""))),
+            snapshotRepoUseLocalStack: makeDirectTypeProxy(expr.dig(snapshotRepo, ["useLocalStack"], false)),
             metadataMigrationJvmArgs: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "jvmArgs"], expr.literal(""))),
             metadataMigrationLoggingConfigurationOverrideConfigMap: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "loggingConfigurationOverrideConfigMap"], expr.literal(""))),
             metadataMigrationComponentTemplateAllowlist: makeDirectTypeProxy(expr.dig(config, ["metadataMigrationConfig", "componentTemplateAllowlist"], expr.literal([]))),
@@ -292,13 +441,16 @@ function makeSnapshotMigrationManifest(
             metadataMigrationClusterAwarenessAttributes: makeDirectTypeProxy(expr.dig(config, ["metadataMigrationConfig", "clusterAwarenessAttributes"], 1)),
             metadataMigrationEnableSourcelessMigrations: makeDirectTypeProxy(expr.dig(config, ["metadataMigrationConfig", "enableSourcelessMigrations"], false)),
             metadataMigrationUseRecoverySource: makeDirectTypeProxy(expr.dig(config, ["metadataMigrationConfig", "useRecoverySource"], false)),
-            metadataMigrationMultiTypeBehavior: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "multiTypeBehavior"], expr.literal("NONE"))),
-            metadataMigrationOtelCollectorEndpoint: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "otelCollectorEndpoint"], expr.literal(""))),
+            metadataMigrationOtelTraceCollectorEndpoint: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "otelTraceCollectorEndpoint"], expr.literal(""))),
+            metadataMigrationOtelMetricsCollectorEndpoint: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "otelMetricsCollectorEndpoint"], expr.literal(""))),
             metadataMigrationOutput: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "output"], expr.literal("HUMAN_READABLE"))),
             metadataMigrationTransformerConfigBase64: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "transformerConfigBase64"], expr.literal(""))),
-            metadataMigrationTransformerConfig: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "transformerConfig"], expr.literal(""))),
+            metadataMigrationTransformerConfig: makeYamlJsonLiteralProxy(expr.dig(config, ["metadataMigrationConfig", "transformerConfig"], expr.literal(""))),
             metadataMigrationTransformerConfigFile: makeStringTypeProxy(expr.dig(config, ["metadataMigrationConfig", "transformerConfigFile"], expr.literal(""))),
-            documentBackfillPodReplicas: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "podReplicas"], 1)),
+            metadataMigrationFileSourceVolumes: makeYamlJsonLiteralProxy(expr.dig(config, ["metadataMigrationConfig", "fileSourceVolumes"], expr.literal([]))),
+            metadataMigrationFileSourceVolumeMounts: makeYamlJsonLiteralProxy(expr.dig(config, ["metadataMigrationConfig", "fileSourceVolumeMounts"], expr.literal([]))),
+            documentBackfillPodReplicas: makeDirectTypeProxy(documentBackfillScaling.documentBackfillPodReplicas),
+            documentBackfillMinPodReplicas: makeDirectTypeProxy(documentBackfillScaling.documentBackfillMinPodReplicas),
             documentBackfillJvmArgs: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "jvmArgs"], expr.literal(""))),
             documentBackfillLoggingConfigurationOverrideConfigMap: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "loggingConfigurationOverrideConfigMap"], expr.literal(""))),
             documentBackfillUseTargetClusterForWorkCoordination: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "useTargetClusterForWorkCoordination"], false)),
@@ -307,16 +459,21 @@ function makeSnapshotMigrationManifest(
             documentBackfillAllowLooseVersionMatching: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "allowLooseVersionMatching"], true)),
             documentBackfillEnableSourcelessMigrations: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "enableSourcelessMigrations"], false)),
             documentBackfillUseRecoverySource: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "useRecoverySource"], false)),
+            documentBackfillPositionGapStopword: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "positionGapStopword"], expr.literal("a"))),
             documentBackfillDocTransformerConfigBase64: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "docTransformerConfigBase64"], expr.literal(""))),
-            documentBackfillDocTransformerConfig: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "docTransformerConfig"], expr.literal(""))),
+            documentBackfillDocTransformerConfig: makeYamlJsonLiteralProxy(expr.dig(config, ["documentBackfillConfig", "docTransformerConfig"], expr.literal(""))),
             documentBackfillDocTransformerConfigFile: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "docTransformerConfigFile"], expr.literal(""))),
+            documentBackfillFileSourceVolumes: makeYamlJsonLiteralProxy(expr.dig(config, ["documentBackfillConfig", "fileSourceVolumes"], expr.literal([]))),
+            documentBackfillFileSourceVolumeMounts: makeYamlJsonLiteralProxy(expr.dig(config, ["documentBackfillConfig", "fileSourceVolumeMounts"], expr.literal([]))),
             documentBackfillDocumentsPerBulkRequest: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "documentsPerBulkRequest"], 0x7fffffff)),
             documentBackfillDocumentsSizePerBulkRequest: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "documentsSizePerBulkRequest"], 10 * 1024 * 1024)),
             documentBackfillInitialLeaseDuration: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "initialLeaseDuration"], expr.literal("PT1H"))),
             documentBackfillMaxConnections: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "maxConnections"], 10)),
             documentBackfillMaxShardSizeBytes: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "maxShardSizeBytes"], 80 * 1024 * 1024 * 1024)),
-            documentBackfillOtelCollectorEndpoint: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "otelCollectorEndpoint"], expr.literal(""))),
+            documentBackfillOtelTraceCollectorEndpoint: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "otelTraceCollectorEndpoint"], expr.literal(""))),
+            documentBackfillOtelMetricsCollectorEndpoint: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "otelMetricsCollectorEndpoint"], expr.literal(""))),
             documentBackfillServerGeneratedIds: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "serverGeneratedIds"], expr.literal("AUTO"))),
+            documentBackfillEmitDocType: makeStringTypeProxy(expr.dig(config, ["documentBackfillConfig", "emitDocType"], expr.literal("AUTO"))),
             documentBackfillAllowedDocExceptionTypes: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "allowedDocExceptionTypes"], expr.literal([]))),
             documentBackfillCoordinatorRetryMaxRetries: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "coordinatorRetryMaxRetries"], 7)),
             documentBackfillCoordinatorRetryInitialDelayMs: makeDirectTypeProxy(expr.dig(config, ["documentBackfillConfig", "coordinatorRetryInitialDelayMs"], 1000)),
@@ -328,21 +485,42 @@ function makeSnapshotMigrationManifest(
 function makeTrafficReplayManifest(
     name: BaseExpression<string>,
     dependsOn: BaseExpression<Serialized<string[]>>,
+    fromCapturedTraffic: BaseExpression<string>,
+    fromCapturedTrafficSourceKind: BaseExpression<"proxy" | "s3">,
     replayerOptions: BaseExpression<Serialized<z.infer<typeof ARGO_REPLAYER_OPTIONS>>>,
     sourceLabel: BaseExpression<string>,
     targetLabel: BaseExpression<string>,
+    targetConnectionIdentity: BaseExpression<Serialized<z.infer<typeof CLUSTER_CONNECTION_IDENTITY>>>,
 ) {
     const opts = expr.deserializeRecord(replayerOptions);
+    const targetIdentity = expr.deserializeRecord(targetConnectionIdentity);
+    const replayerScaling = scalingFromRecord(opts);
     const workflowSpecFields = expr.makeDict({
         dependsOn: expr.deserializeRecord(dependsOn),
+        fromCapturedTraffic,
+        fromCapturedTrafficSourceKind,
+        sourceLabel,
+        targetLabel,
+        targetEndpoint: expr.dig(targetIdentity, ["endpoint"], expr.literal("")),
+        targetAllowInsecure: expr.dig(targetIdentity, ["allowInsecure"], false),
+        targetAuthType: expr.dig(targetIdentity, ["authType"], expr.literal("none")),
+        targetAuthBasicSecretName: expr.dig(targetIdentity, ["authBasicSecretName"], expr.literal("")),
+        targetAuthSigv4Region: expr.dig(targetIdentity, ["authSigv4Region"], expr.literal("")),
+        targetAuthSigv4Service: expr.dig(targetIdentity, ["authSigv4Service"], expr.literal("")),
+        targetAuthMtlsClientSecretName: expr.dig(targetIdentity, ["authMtlsClientSecretName"], expr.literal("")),
+        targetAuthMtlsCaCertHash: expr.dig(targetIdentity, ["authMtlsCaCertHash"], expr.literal("")),
         jvmArgs: expr.dig(opts, ["jvmArgs"], expr.literal("")),
         loggingConfigurationOverrideConfigMap: expr.dig(
             opts,
             ["loggingConfigurationOverrideConfigMap"],
             expr.literal("")
         ),
-        podReplicas: expr.dig(opts, ["podReplicas"], 1),
+        useLocalStack: expr.dig(opts, ["useLocalStack"], false),
+        podReplicas: replayerScaling.podReplicas,
+        minPodReplicas: replayerScaling.minPodReplicas,
         resources: expr.get(opts, "resources"),
+        fileSourceVolumes: expr.dig(opts, ["fileSourceVolumes"], expr.literal([])),
+        fileSourceVolumeMounts: expr.dig(opts, ["fileSourceVolumeMounts"], expr.literal([])),
     });
     return {
         apiVersion: CRD_API_VERSION,
@@ -351,7 +529,7 @@ function makeTrafficReplayManifest(
             name: makeStringTypeProxy(name),
             labels: {
                 [WORKFLOW_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("name")),
-                [RUN_UID_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("uid")),
+                [RUN_NUMBER_LABEL]: MIGRATION_RUN_NUMBER_VALUE,
                 [SOURCE_LABEL]: makeStringTypeProxy(sourceLabel),
                 [TARGET_LABEL]: makeStringTypeProxy(targetLabel),
                 [TASK_LABEL]: "trafficReplayer",
@@ -370,9 +548,6 @@ export const ResourceManagement = WorkflowBuilder.create({
 })
 
     .addParams(CommonWorkflowParameters)
-
-    // ── Root resource mutations ──────────────────────────────────────────
-
     .addTemplate("upsertKafkaClusterResource", t => t
         .addRequiredInput("kafkaClusterConfig", typeToken<z.infer<typeof NAMED_KAFKA_CLUSTER_CONFIG>>())
         .addResourceTask(b => b
@@ -388,11 +563,16 @@ export const ResourceManagement = WorkflowBuilder.create({
     .addTemplate("upsertCapturedTrafficResource", t => t
         .addRequiredInput("topicCrName", typeToken<string>())
         .addRequiredInput("kafkaClusterName", typeToken<string>())
+        .addRequiredInput("kafkaConfig", typeToken<z.infer<typeof NAMED_KAFKA_CLIENT_CONFIG>>())
         .addRequiredInput("kafkaTopicName", typeToken<string>())
         .addRequiredInput("sourceLabel", typeToken<string>())
         .addRequiredInput("partitions", typeToken<number>())
         .addRequiredInput("replicas", typeToken<number>())
         .addRequiredInput("topicConfig", typeToken<Serialized<Record<string, any>>>())
+        // sourceKind = "proxy" or "s3" — VAP-locked once the CR exists.
+        // s3SourceUri is empty for the proxy path, set for s3.
+        .addOptionalInput("sourceKind", c => "proxy")
+        .addOptionalInput("s3SourceUri", c => "")
         .addResourceTask(b => b
             .setDefinition({
                 action: "apply",
@@ -400,11 +580,14 @@ export const ResourceManagement = WorkflowBuilder.create({
                 manifest: makeCapturedTrafficManifest(
                     b.inputs.topicCrName,
                     b.inputs.kafkaClusterName,
+                    b.inputs.kafkaConfig,
                     b.inputs.kafkaTopicName,
                     b.inputs.sourceLabel,
                     b.inputs.partitions,
                     b.inputs.replicas,
-                    b.inputs.topicConfig
+                    b.inputs.topicConfig,
+                    b.inputs.sourceKind,
+                    b.inputs.s3SourceUri,
                 )
             }))
         .addJsonPathOutput("currentConfigChecksum", "{.status.configChecksum}", typeToken<string>())
@@ -412,7 +595,7 @@ export const ResourceManagement = WorkflowBuilder.create({
     )
 
     .addTemplate("upsertCaptureProxyResource", t => t
-        .addRequiredInput("proxyConfig", typeToken<z.infer<typeof DENORMALIZED_PROXY_CONFIG>>())
+        .addRequiredInput("proxyConfig", typeToken<z.infer<typeof DENORMALIZED_PROXY_SETUP_CONFIG>>())
         .addRequiredInput("proxyName", typeToken<string>())
         .addRequiredInput("topicCrName", typeToken<string>())
         .addResourceTask(b => b
@@ -432,10 +615,12 @@ export const ResourceManagement = WorkflowBuilder.create({
         .addResourceTask(b => {
             const snapshotItemConfig = expr.deserializeRecord(b.inputs.snapshotItemConfig);
             const snapshotOptions = expr.get(snapshotItemConfig, "config");
+            const sourceIdentity = expr.get(snapshotItemConfig, "sourceConnectionIdentity");
+            const repo = expr.get(snapshotItemConfig, "repo");
 
             return b.setDefinition({
-                action: "patch",
-                flags: ["--type", "merge"],
+                action: "apply",
+                setOwnerReference: false,
                 manifest: {
                     apiVersion: CRD_API_VERSION,
                     kind: "DataSnapshot",
@@ -443,15 +628,59 @@ export const ResourceManagement = WorkflowBuilder.create({
                         name: b.inputs.resourceName,
                         labels: {
                             [WORKFLOW_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("name")),
-                            [RUN_UID_LABEL]: makeStringTypeProxy(expr.getWorkflowValue("uid")),
+                            [RUN_NUMBER_LABEL]: MIGRATION_RUN_NUMBER_VALUE,
                             [SOURCE_LABEL]: makeStringTypeProxy(b.inputs.sourceLabel),
                             [SNAPSHOT_LABEL]: makeStringTypeProxy(expr.get(snapshotItemConfig, "label")),
                         }
                     },
                     spec: {
+                        // Written by tryApply so the live CR carries its reset-DAG edges (workflow reset
+                        // reads spec.dependsOn). The transformer stamps the resolved proxy-setup names as a
+                        // flat list on the item; empty when the snapshot depends on no proxy setups.
+                        dependsOn: makeDirectTypeProxy(expr.dig(snapshotItemConfig, ["dependsOn"], expr.literal([]))),
+                        sourceLabel: makeStringTypeProxy(expr.dig(sourceIdentity, ["label"], b.inputs.sourceLabel)),
+                        sourceVersion: makeStringTypeProxy(expr.dig(sourceIdentity, ["version"], expr.literal(""))),
+                        sourceEndpoint: makeStringTypeProxy(expr.dig(sourceIdentity, ["endpoint"], expr.literal(""))),
+                        sourceAllowInsecure: makeDirectTypeProxy(expr.dig(sourceIdentity, ["allowInsecure"], false)),
+                        sourceAuthType: makeStringTypeProxy(expr.dig(sourceIdentity, ["authType"], expr.literal("none"))),
+                        sourceAuthBasicSecretName: makeStringTypeProxy(
+                            expr.dig(sourceIdentity, ["authBasicSecretName"], expr.literal(""))
+                        ),
+                        sourceAuthSigv4Region: makeStringTypeProxy(
+                            expr.dig(sourceIdentity, ["authSigv4Region"], expr.literal(""))
+                        ),
+                        sourceAuthSigv4Service: makeStringTypeProxy(
+                            expr.dig(sourceIdentity, ["authSigv4Service"], expr.literal(""))
+                        ),
+                        sourceAuthMtlsClientSecretName: makeStringTypeProxy(
+                            expr.dig(sourceIdentity, ["authMtlsClientSecretName"], expr.literal(""))
+                        ),
+                        sourceAuthMtlsCaCertHash: makeStringTypeProxy(
+                            expr.dig(sourceIdentity, ["authMtlsCaCertHash"], expr.literal(""))
+                        ),
+                        snapshotLabel: makeStringTypeProxy(expr.get(snapshotItemConfig, "label")),
+                        repoName: makeStringTypeProxy(expr.dig(repo, ["repoName"], expr.literal(""))),
+                        repoPathUri: makeStringTypeProxy(expr.dig(repo, ["repoPathUri"], expr.literal(""))),
+                        repoAwsRegion: makeStringTypeProxy(expr.dig(repo, ["awsRegion"], expr.literal(""))),
+                        repoEndpoint: makeStringTypeProxy(expr.dig(repo, ["endpoint"], expr.literal(""))),
+                        repoS3RoleArn: makeStringTypeProxy(expr.dig(repo, ["s3RoleArn"], expr.literal(""))),
+                        repoUseLocalStack: makeDirectTypeProxy(expr.dig(repo, ["useLocalStack"], false)),
                         snapshotPrefix: makeStringTypeProxy(expr.get(snapshotItemConfig, "snapshotPrefix")),
+                        mode: makeStringTypeProxy(expr.dig(snapshotOptions, ["mode"], expr.literal("create"))),
+                        solrExternalBackupName: makeStringTypeProxy(
+                            expr.dig(snapshotItemConfig, ["solrExternalBackupName"], expr.literal(""))
+                        ),
+                        otelTraceCollectorEndpoint: makeStringTypeProxy(
+                            expr.dig(snapshotOptions, ["otelTraceCollectorEndpoint"], expr.literal(""))
+                        ),
+                        otelMetricsCollectorEndpoint: makeStringTypeProxy(
+                            expr.dig(snapshotOptions, ["otelMetricsCollectorEndpoint"], expr.literal(""))
+                        ),
+                        solrCollections: makeDirectTypeProxy(
+                            expr.dig(snapshotOptions, ["solrCollections"], expr.literal([]))
+                        ),
                         indexAllowlist: makeDirectTypeProxy(
-                            expr.dig(snapshotOptions, ["indexAllowlist"], expr.literal([])) as any
+                            expr.dig(snapshotOptions, ["indexAllowlist"], expr.literal([]))
                         ),
                         maxSnapshotRateMbPerNode: makeDirectTypeProxy(
                             expr.dig(snapshotOptions, ["maxSnapshotRateMbPerNode"], 0)
@@ -459,6 +688,12 @@ export const ResourceManagement = WorkflowBuilder.create({
                         jvmArgs: makeStringTypeProxy(expr.dig(snapshotOptions, ["jvmArgs"], expr.literal(""))),
                         loggingConfigurationOverrideConfigMap: makeStringTypeProxy(
                             expr.dig(snapshotOptions, ["loggingConfigurationOverrideConfigMap"], expr.literal(""))
+                        ),
+                        compressionEnabled: makeDirectTypeProxy(
+                            expr.dig(snapshotOptions, ["compressionEnabled"], false)
+                        ),
+                        includeGlobalState: makeDirectTypeProxy(
+                            expr.dig(snapshotOptions, ["includeGlobalState"], true)
                         )
                     }
                 }
@@ -482,15 +717,23 @@ export const ResourceManagement = WorkflowBuilder.create({
             }))
         .addJsonPathOutput("currentConfigChecksum", "{.status.configChecksum}", typeToken<string>())
         .addJsonPathOutput("resourceCreationTimestamp", "{.metadata.creationTimestamp}", typeToken<string>())
+        // Emit the real apiserver-assigned UID so downstream owned resources (RFS coordinator
+        // Secret/Service/StatefulSet) can set valid ownerReferences. Without this, callers
+        // would propagate a placeholder UID (e.g. "imported" for BYOS/imported-cluster paths)
+        // and Kubernetes GC would delete the owned resources within ~1s as orphaned children.
+        .addJsonPathOutput("resourceUid", "{.metadata.uid}", typeToken<string>())
         .addRetryParameters(K8S_RESOURCE_RETRY_STRATEGY)
     )
 
     .addTemplate("upsertTrafficReplayResource", t => t
         .addRequiredInput("name", typeToken<string>())
         .addRequiredInput("dependsOn", typeToken<string[]>())
+        .addRequiredInput("fromCapturedTraffic", typeToken<string>())
+        .addRequiredInput("fromCapturedTrafficSourceKind", typeToken<"proxy" | "s3">())
         .addRequiredInput("replayerOptions", typeToken<z.infer<typeof ARGO_REPLAYER_OPTIONS>>())
         .addRequiredInput("sourceLabel", typeToken<string>())
         .addRequiredInput("targetLabel", typeToken<string>())
+        .addRequiredInput("targetConnectionIdentity", typeToken<z.infer<typeof CLUSTER_CONNECTION_IDENTITY>>())
         .addResourceTask(b => b
             .setDefinition({
                 action: "apply",
@@ -498,9 +741,12 @@ export const ResourceManagement = WorkflowBuilder.create({
                 manifest: makeTrafficReplayManifest(
                     b.inputs.name,
                     b.inputs.dependsOn,
+                    b.inputs.fromCapturedTraffic,
+                    b.inputs.fromCapturedTrafficSourceKind,
                     b.inputs.replayerOptions,
                     b.inputs.sourceLabel,
-                    b.inputs.targetLabel
+                    b.inputs.targetLabel,
+                    b.inputs.targetConnectionIdentity
                 )
             }))
         .addJsonPathOutput("currentConfigChecksum", "{.status.configChecksum}", typeToken<string>())
@@ -509,7 +755,7 @@ export const ResourceManagement = WorkflowBuilder.create({
 
     // ── Approval gate primitives ─────────────────────────────────────────
 
-    .addTemplate("waitForApproval", t => t
+    .addTemplate("waitForUserApproval", t => t
         .addRequiredInput("resourceName", typeToken<string>())
         .addWaitForExistingResource(b => b
             .setDefinition({
@@ -520,6 +766,7 @@ export const ResourceManagement = WorkflowBuilder.create({
                 },
                 conditions: {successCondition: "status.phase == Approved"}
             })
+            .addRetryParameters(K8S_USER_APPROVAL_WAIT_RETRY_STRATEGY)
         )
     )
 
@@ -537,8 +784,7 @@ export const ResourceManagement = WorkflowBuilder.create({
                     metadata: {
                         name: b.inputs.resourceName,
                         annotations: {
-                            "migrations.opensearch.org/approved-by-run":
-                                makeStringTypeProxy(expr.getWorkflowValue("uid"))
+                            [APPROVED_DURING_RUN_ANNOTATION]: MIGRATION_RUN_NUMBER_VALUE
                         }
                     }
                 }
@@ -563,10 +809,18 @@ export const ResourceManagement = WorkflowBuilder.create({
         .addRetryParameters(K8S_RESOURCE_RETRY_STRATEGY)
     )
 
+    .addTemplate("patchKafkaClusterPending", t => buildPatchStatusTemplate(t, "KafkaCluster", {}))
+    .addTemplate("patchCapturedTrafficPending", t => buildPatchStatusTemplate(t, "CapturedTraffic", {}))
+    .addTemplate("patchCaptureProxyPending", t => buildPatchStatusTemplate(t, "CaptureProxy", {}))
+    .addTemplate("patchDataSnapshotPending", t => buildPatchStatusTemplate(t, "DataSnapshot", {}))
+    .addTemplate("patchSnapshotMigrationPending", t => buildPatchStatusTemplate(t, "SnapshotMigration", {}))
+    .addTemplate("patchTrafficReplayPending", t => buildPatchStatusTemplate(t, "TrafficReplay", {}))
+
     // ── Root reconcile wrappers ──────────────────────────────────────────
 
     .addTemplate("reconcileKafkaClusterResource", t => t
         .addRequiredInput("kafkaClusterConfig", typeToken<z.infer<typeof NAMED_KAFKA_CLUSTER_CONFIG>>())
+        .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("retryGateName", typeToken<string>())
         .addOptionalInput("retryGroupName_view", c => "Apply")
 
@@ -577,7 +831,17 @@ export const ResourceManagement = WorkflowBuilder.create({
                 }),
                 {continueOn: {failed: true}}
             )
-            .addStep("waitForFix", INTERNAL, "waitForApproval", c =>
+            .addStep("markPending", INTERNAL, "patchKafkaClusterPending", c =>
+                c.register({
+                    resourceName: expr.jsonPathStrict(b.inputs.kafkaClusterConfig, "name"),
+                    phase: expr.literal("Pending"),
+                }),
+                {when: c => ({templateExp: expr.and(
+                    expr.equals(c.tryApply.status, "Succeeded"),
+                    expr.not(expr.equals(c.tryApply.outputs.currentConfigChecksum, b.inputs.configChecksum))
+                )})}
+            )
+            .addStep("waitForFix", INTERNAL, "waitForUserApproval", c =>
                 c.register({
                     resourceName: b.inputs.retryGateName,
                 }),
@@ -601,6 +865,7 @@ export const ResourceManagement = WorkflowBuilder.create({
             .addStepToSelf("retryLoop", c =>
                 c.register({
                     kafkaClusterConfig: b.inputs.kafkaClusterConfig,
+                    configChecksum: b.inputs.configChecksum,
                     retryGateName: b.inputs.retryGateName,
                     retryGroupName_view: b.inputs.retryGroupName_view,
                 }),
@@ -618,28 +883,45 @@ export const ResourceManagement = WorkflowBuilder.create({
     .addTemplate("reconcileCapturedTrafficResource", t => t
         .addRequiredInput("topicCrName", typeToken<string>())
         .addRequiredInput("kafkaClusterName", typeToken<string>())
+        .addRequiredInput("kafkaConfig", typeToken<z.infer<typeof NAMED_KAFKA_CLIENT_CONFIG>>())
         .addRequiredInput("kafkaTopicName", typeToken<string>())
         .addRequiredInput("partitions", typeToken<number>())
         .addRequiredInput("replicas", typeToken<number>())
         .addRequiredInput("topicConfig", typeToken<Serialized<Record<string, any>>>())
         .addRequiredInput("sourceLabel", typeToken<string>())
+        .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("retryGateName", typeToken<string>())
         .addOptionalInput("retryGroupName_view", c => "Apply")
+        .addOptionalInput("sourceKind", c => "proxy")
+        .addOptionalInput("s3SourceUri", c => "")
 
         .addSteps(b => b
             .addStep("tryApply", INTERNAL, "upsertCapturedTrafficResource", c =>
                 c.register({
                     topicCrName: b.inputs.topicCrName,
                     kafkaClusterName: b.inputs.kafkaClusterName,
+                    kafkaConfig: b.inputs.kafkaConfig,
                     kafkaTopicName: b.inputs.kafkaTopicName,
                     sourceLabel: b.inputs.sourceLabel,
                     partitions: b.inputs.partitions,
                     replicas: b.inputs.replicas,
                     topicConfig: b.inputs.topicConfig,
+                    sourceKind: b.inputs.sourceKind,
+                    s3SourceUri: b.inputs.s3SourceUri,
                 }),
                 {continueOn: {failed: true}}
             )
-            .addStep("waitForFix", INTERNAL, "waitForApproval", c =>
+            .addStep("markPending", INTERNAL, "patchCapturedTrafficPending", c =>
+                c.register({
+                    resourceName: b.inputs.topicCrName,
+                    phase: expr.literal("Pending"),
+                }),
+                {when: c => ({templateExp: expr.and(
+                    expr.equals(c.tryApply.status, "Succeeded"),
+                    expr.not(expr.equals(c.tryApply.outputs.currentConfigChecksum, b.inputs.configChecksum))
+                )})}
+            )
+            .addStep("waitForFix", INTERNAL, "waitForUserApproval", c =>
                 c.register({
                     resourceName: b.inputs.retryGateName,
                 }),
@@ -664,11 +946,15 @@ export const ResourceManagement = WorkflowBuilder.create({
                 c.register({
                     topicCrName: b.inputs.topicCrName,
                     kafkaClusterName: b.inputs.kafkaClusterName,
+                    kafkaConfig: b.inputs.kafkaConfig,
                     kafkaTopicName: b.inputs.kafkaTopicName,
                     sourceLabel: b.inputs.sourceLabel,
                     partitions: b.inputs.partitions,
                     replicas: b.inputs.replicas,
                     topicConfig: b.inputs.topicConfig,
+                    sourceKind: b.inputs.sourceKind,
+                    s3SourceUri: b.inputs.s3SourceUri,
+                    configChecksum: b.inputs.configChecksum,
                     retryGateName: b.inputs.retryGateName,
                     retryGroupName_view: b.inputs.retryGroupName_view,
                 }),
@@ -684,9 +970,10 @@ export const ResourceManagement = WorkflowBuilder.create({
     )
 
     .addTemplate("reconcileCaptureProxyResource", t => t
-        .addRequiredInput("proxyConfig", typeToken<z.infer<typeof DENORMALIZED_PROXY_CONFIG>>())
+        .addRequiredInput("proxyConfig", typeToken<z.infer<typeof DENORMALIZED_PROXY_SETUP_CONFIG>>())
         .addRequiredInput("proxyName", typeToken<string>())
         .addRequiredInput("topicCrName", typeToken<string>())
+        .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("retryGateName", typeToken<string>())
         .addOptionalInput("retryGroupName_view", c => "Apply")
 
@@ -699,7 +986,17 @@ export const ResourceManagement = WorkflowBuilder.create({
                 }),
                 {continueOn: {failed: true}}
             )
-            .addStep("waitForFix", INTERNAL, "waitForApproval", c =>
+            .addStep("markPending", INTERNAL, "patchCaptureProxyPending", c =>
+                c.register({
+                    resourceName: b.inputs.proxyName,
+                    phase: expr.literal("Pending"),
+                }),
+                {when: c => ({templateExp: expr.and(
+                    expr.equals(c.tryApply.status, "Succeeded"),
+                    expr.not(expr.equals(c.tryApply.outputs.currentConfigChecksum, b.inputs.configChecksum))
+                )})}
+            )
+            .addStep("waitForFix", INTERNAL, "waitForUserApproval", c =>
                 c.register({
                     resourceName: b.inputs.retryGateName,
                 }),
@@ -725,6 +1022,7 @@ export const ResourceManagement = WorkflowBuilder.create({
                     proxyConfig: b.inputs.proxyConfig,
                     proxyName: b.inputs.proxyName,
                     topicCrName: b.inputs.topicCrName,
+                    configChecksum: b.inputs.configChecksum,
                     retryGateName: b.inputs.retryGateName,
                     retryGroupName_view: b.inputs.retryGroupName_view,
                 }),
@@ -743,6 +1041,8 @@ export const ResourceManagement = WorkflowBuilder.create({
         .addRequiredInput("resourceName", typeToken<string>())
         .addRequiredInput("snapshotItemConfig", typeToken<z.infer<typeof PER_SOURCE_CREATE_SNAPSHOTS_CONFIG>>())
         .addRequiredInput("sourceLabel", typeToken<string>())
+        .addRequiredInput("configChecksum", typeToken<string>())
+        .addRequiredInput("retryGateName", typeToken<string>())
         .addOptionalInput("retryGroupName_view", c => "Apply")
 
         .addSteps(b => b
@@ -753,6 +1053,53 @@ export const ResourceManagement = WorkflowBuilder.create({
                     sourceLabel: b.inputs.sourceLabel,
                 }),
                 {continueOn: {failed: true}}
+            )
+            .addStep("markPending", INTERNAL, "patchDataSnapshotPending", c =>
+                c.register({
+                    resourceName: b.inputs.resourceName,
+                    phase: expr.literal("Pending"),
+                }),
+                {when: c => ({templateExp: expr.and(
+                    expr.equals(c.tryApply.status, "Succeeded"),
+                    expr.not(expr.equals(c.tryApply.outputs.currentConfigChecksum, b.inputs.configChecksum))
+                )})}
+            )
+            // VAP-retry recovery loop, matching the other reconciles. DataSnapshot has no gated
+            // fields today, so this does not fire during normal reconfiguration; it is the recovery
+            // path for a rejected apply (e.g. lock-on-complete on a re-apply of a Completed CR, or a
+            // future gated field). Without it, a VAP-rejected DataSnapshot apply is a silent dead end:
+            // the step fails, continueOn swallows it, and the user cannot recover within the run.
+            .addStep("waitForFix", INTERNAL, "waitForUserApproval", c =>
+                c.register({
+                    resourceName: b.inputs.retryGateName,
+                }),
+                {when: c => ({templateExp: expr.equals(c.tryApply.status, "Failed")})}
+            )
+            .addStep("patchApproval", INTERNAL, "patchApprovalAnnotation", c =>
+                c.register({
+                    resourceApiVersion: expr.literal(CRD_API_VERSION),
+                    resourceKind: expr.literal("DataSnapshot"),
+                    resourceName: b.inputs.resourceName,
+                }),
+                {when: c => ({templateExp: expr.equals(c.waitForFix.status, "Succeeded")})}
+            )
+            .addStep("resetGate", INTERNAL, "patchApprovalGatePhase", c =>
+                c.register({
+                    resourceName: b.inputs.retryGateName,
+                    phase: expr.literal("Pending"),
+                }),
+                {when: c => ({templateExp: expr.equals(c.patchApproval.status, "Succeeded")})}
+            )
+            .addStepToSelf("retryLoop", c =>
+                c.register({
+                    resourceName: b.inputs.resourceName,
+                    snapshotItemConfig: b.inputs.snapshotItemConfig,
+                    sourceLabel: b.inputs.sourceLabel,
+                    configChecksum: b.inputs.configChecksum,
+                    retryGateName: b.inputs.retryGateName,
+                    retryGroupName_view: b.inputs.retryGroupName_view,
+                }),
+                {when: c => ({templateExp: expr.equals(c.resetGate.status, "Succeeded")})}
             )
         )
         .addExpressionOutput("currentConfigChecksum", c =>
@@ -766,6 +1113,7 @@ export const ResourceManagement = WorkflowBuilder.create({
     .addTemplate("reconcileSnapshotMigrationResource", t => t
         .addRequiredInput("snapshotMigrationConfig", typeToken<z.infer<typeof SNAPSHOT_MIGRATION_CONFIG>>())
         .addRequiredInput("resourceName", typeToken<string>())
+        .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("retryGateName", typeToken<string>())
         .addOptionalInput("retryGroupName_view", c => "Apply")
 
@@ -777,7 +1125,17 @@ export const ResourceManagement = WorkflowBuilder.create({
                 }),
                 {continueOn: {failed: true}}
             )
-            .addStep("waitForFix", INTERNAL, "waitForApproval", c =>
+            .addStep("markPending", INTERNAL, "patchSnapshotMigrationPending", c =>
+                c.register({
+                    resourceName: b.inputs.resourceName,
+                    phase: expr.literal("Pending"),
+                }),
+                {when: c => ({templateExp: expr.and(
+                    expr.equals(c.tryApply.status, "Succeeded"),
+                    expr.not(expr.equals(c.tryApply.outputs.currentConfigChecksum, b.inputs.configChecksum))
+                )})}
+            )
+            .addStep("waitForFix", INTERNAL, "waitForUserApproval", c =>
                 c.register({
                     resourceName: b.inputs.retryGateName,
                 }),
@@ -802,6 +1160,7 @@ export const ResourceManagement = WorkflowBuilder.create({
                 c.register({
                     snapshotMigrationConfig: b.inputs.snapshotMigrationConfig,
                     resourceName: b.inputs.resourceName,
+                    configChecksum: b.inputs.configChecksum,
                     retryGateName: b.inputs.retryGateName,
                     retryGroupName_view: b.inputs.retryGroupName_view,
                 }),
@@ -820,14 +1179,24 @@ export const ResourceManagement = WorkflowBuilder.create({
                 c.steps.tryApply.outputs.resourceCreationTimestamp,
                 expr.literal("")
             ))
+        .addExpressionOutput("resourceUid", c =>
+            expr.ternary(
+                expr.equals(c.steps.tryApply.status, "Succeeded"),
+                c.steps.tryApply.outputs.resourceUid,
+                expr.literal("")
+            ))
     )
 
     .addTemplate("reconcileTrafficReplayResource", t => t
         .addRequiredInput("name", typeToken<string>())
         .addRequiredInput("dependsOn", typeToken<string[]>())
+        .addRequiredInput("fromCapturedTraffic", typeToken<string>())
+        .addRequiredInput("fromCapturedTrafficSourceKind", typeToken<"proxy" | "s3">())
         .addRequiredInput("replayerOptions", typeToken<z.infer<typeof ARGO_REPLAYER_OPTIONS>>())
         .addRequiredInput("sourceLabel", typeToken<string>())
         .addRequiredInput("targetLabel", typeToken<string>())
+        .addRequiredInput("targetConnectionIdentity", typeToken<z.infer<typeof CLUSTER_CONNECTION_IDENTITY>>())
+        .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("retryGateName", typeToken<string>())
         .addOptionalInput("retryGroupName_view", c => "Apply")
 
@@ -836,13 +1205,26 @@ export const ResourceManagement = WorkflowBuilder.create({
                 c.register({
                     name: b.inputs.name,
                     dependsOn: b.inputs.dependsOn,
+                    fromCapturedTraffic: b.inputs.fromCapturedTraffic,
+                    fromCapturedTrafficSourceKind: b.inputs.fromCapturedTrafficSourceKind,
                     replayerOptions: b.inputs.replayerOptions,
                     sourceLabel: b.inputs.sourceLabel,
                     targetLabel: b.inputs.targetLabel,
+                    targetConnectionIdentity: b.inputs.targetConnectionIdentity,
                 }),
                 {continueOn: {failed: true}}
             )
-            .addStep("waitForFix", INTERNAL, "waitForApproval", c =>
+            .addStep("markPending", INTERNAL, "patchTrafficReplayPending", c =>
+                c.register({
+                    resourceName: b.inputs.name,
+                    phase: expr.literal("Pending"),
+                }),
+                {when: c => ({templateExp: expr.and(
+                    expr.equals(c.tryApply.status, "Succeeded"),
+                    expr.not(expr.equals(c.tryApply.outputs.currentConfigChecksum, b.inputs.configChecksum))
+                )})}
+            )
+            .addStep("waitForFix", INTERNAL, "waitForUserApproval", c =>
                 c.register({
                     resourceName: b.inputs.retryGateName,
                 }),
@@ -867,9 +1249,13 @@ export const ResourceManagement = WorkflowBuilder.create({
                 c.register({
                     name: b.inputs.name,
                     dependsOn: b.inputs.dependsOn,
+                    fromCapturedTraffic: b.inputs.fromCapturedTraffic,
+                    fromCapturedTrafficSourceKind: b.inputs.fromCapturedTrafficSourceKind,
                     replayerOptions: b.inputs.replayerOptions,
                     sourceLabel: b.inputs.sourceLabel,
                     targetLabel: b.inputs.targetLabel,
+                    targetConnectionIdentity: b.inputs.targetConnectionIdentity,
+                    configChecksum: b.inputs.configChecksum,
                     retryGateName: b.inputs.retryGateName,
                     retryGroupName_view: b.inputs.retryGroupName_view,
                 }),
@@ -889,18 +1275,17 @@ export const ResourceManagement = WorkflowBuilder.create({
     .addTemplate("patchKafkaClusterReady", t => buildPatchStatusTemplate(t, "KafkaCluster", {
         configChecksum: ""
     }))
-    .addTemplate("patchCapturedTrafficRunning", t => buildPatchStatusTemplate(t, "CapturedTraffic", {}))
     .addTemplate("patchCapturedTrafficReady", t => buildPatchStatusTemplate(t, "CapturedTraffic", {
         configChecksum: "",
-        checksumForSnapshot: "",
-        checksumForReplayer: ""
+        checksumForSnapshot: ""
     }))
     .addTemplate("patchCapturedTrafficError", t => buildPatchStatusTemplate(t, "CapturedTraffic", {}))
-    .addTemplate("patchCaptureProxyRunning", t => buildPatchStatusTemplate(t, "CaptureProxy", {}))
     .addTemplate("patchCaptureProxyReady", t => buildPatchStatusTemplate(t, "CaptureProxy", {
         configChecksum: "",
         checksumForSnapshot: "",
-        checksumForReplayer: ""
+        checksumForReplayer: "",
+        serviceEndpoint: "",
+        loadBalancerEndpoint: "",
     }))
     .addTemplate("patchCaptureProxyError", t => buildPatchStatusTemplate(t, "CaptureProxy", {}))
     .addTemplate("patchDataSnapshotCompleted", t => buildPatchStatusTemplate(t, "DataSnapshot", {
@@ -920,8 +1305,11 @@ export const ResourceManagement = WorkflowBuilder.create({
         configChecksum: ""
     }))
 
-
-    // ── Wait templates (resource get with retry) ─────────────────────────
+    // Leaf Kubernetes/Strimzi/cert-manager waits use bounded infra retries.
+    // Waits on our own migration status resources can run much longer in a
+    // single attempt because another workflow branch is responsible for moving
+    // the CR to Ready/Completed/Error. Their retry limit only protects against
+    // wait pod eviction or transient API failures.
 
     .addTemplate("waitForKafkaClusterCreated", t => t
         .addRequiredInput("resourceName", typeToken<string>())
@@ -932,42 +1320,74 @@ export const ResourceManagement = WorkflowBuilder.create({
                 waitForCreation: {
                     kubectlImage: b.inputs.imageMigrationConsoleLocation,
                     kubectlImagePullPolicy: b.inputs.imageMigrationConsolePullPolicy,
-                    maxDurationSeconds: LONGEST_POSSIBLE_MIGRATION
+                    maxDurationSeconds: K8S_INFRA_READY_TIMEOUT_SECONDS,
+                    maxKubeWaitDuration: 60,
+                    retryLimit: 15,
+                    retryInitialBackoffDuration: 10,
+                    retryFactor: 2,
                 }
             })
         )
     )
 
 
-    .addTemplate("waitForKafkaClusterReady", t => t
+    // Argo resource-template conditions are Kubernetes label selectors evaluated
+    // against JSON paths. They cannot search status.conditions by type, so
+    // `status.conditions.0.type == Ready` breaks whenever Strimzi emits Warning
+    // conditions before Ready. Use a tiny kubectl+jq loop for exact Strimzi
+    // Ready semantics while still keeping this as a ResourceManagement wait.
+    .addTemplate("waitForKafkaClusterReadyResource", t => t
         .addRequiredInput("resourceName", typeToken<string>())
         .addInputsFromRecord(makeRequiredImageParametersForKeys(["MigrationConsole"]))
+        .addContainer(b => b
+            .addImageInfo(b.inputs.imageMigrationConsoleLocation, b.inputs.imageMigrationConsolePullPolicy)
+            .addCommand(["/bin/bash", "-lc"])
+            .addResources(DEFAULT_RESOURCES.SHELL_MIGRATION_CONSOLE_CLI)
+            .addEnvVarsFromRecord({
+                NAMESPACE: expr.getWorkflowValue("namespace"),
+                KAFKA_CLUSTER_NAME: b.inputs.resourceName,
+                TIMEOUT_SECONDS: expr.literal(String(KAFKA_CLUSTER_READY_TIMEOUT_SECONDS)),
+                ...workflowScriptRootEnvVars(t.inputs.workflowParameters.workflowScriptsRoot)
+            })
+            .addArgs([workflowScriptCommand("waitForKafkaClusterReady.sh")])
+            .addActiveDeadlineSeconds(() => KAFKA_READY_WAIT_ACTIVE_DEADLINE_SECONDS)
+        )
+        .addRetryParameters(KAFKA_READY_WAIT_POD_RETRY_STRATEGY)
+    )
+
+    .addTemplate("waitForKafkaTopicReady", t => t
+        .addRequiredInput("topicName", typeToken<string>())
         .addWaitForExistingResource(b => b
             .setDefinition({
                 resource: {
                     apiVersion: "kafka.strimzi.io/v1",
-                    kind: "Kafka",
-                    name: b.inputs.resourceName
+                    kind: "KafkaTopic",
+                    name: b.inputs.topicName
                 },
                 conditions: {
-                    successCondition: expr.literal("status.listeners")
+                    successCondition: "status.conditions.0.type == Ready, status.conditions.0.status == True"
                 }
             })
-            .addRetryParameters(K8S_RESOURCE_RETRY_STRATEGY)
+            .addRetryParameters(K8S_INFRA_READY_RETRY_STRATEGY)
         )
     )
 
 
-    .addTemplate("waitForKafkaCluster", t => t
-        .addRequiredInput("resourceName", typeToken<string>())
-        .addInputsFromRecord(makeRequiredImageParametersForKeys(["MigrationConsole"]))
-        .addSteps(b => b
-            .addStep("waitForCreation", INTERNAL, "waitForKafkaClusterCreated", c =>
-                c.register({...selectInputsForRegister(b, c), resourceName: b.inputs.resourceName})
-            )
-            .addStep("waitForReady", INTERNAL, "waitForKafkaClusterReady", c =>
-                c.register({...selectInputsForRegister(b, c), resourceName: b.inputs.resourceName})
-            )
+    .addTemplate("waitForSecretKey", t => t
+        .addRequiredInput("secretName", typeToken<string>())
+        .addRequiredInput("secretKey", typeToken<string>())
+        .addWaitForExistingResource(b => b
+            .setDefinition({
+                resource: {
+                    apiVersion: "v1",
+                    kind: "Secret",
+                    name: b.inputs.secretName
+                },
+                conditions: {
+                    successCondition: expr.concat(expr.literal("data."), b.inputs.secretKey)
+                }
+            })
+            .addRetryParameters(K8S_SECRET_READY_RETRY_STRATEGY)
         )
     )
 
@@ -989,7 +1409,7 @@ export const ResourceManagement = WorkflowBuilder.create({
         .addRetryParameters(K8S_RESOURCE_RETRY_STRATEGY)
     )
 
-    .addTemplate("waitForCapturedTraffic", t => t
+    .addTemplate("waitIndefinitelyForCapturedTraffic", t => t
         .addRequiredInput("resourceName", typeToken<string>())
         .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("checksumField", typeToken<string>())
@@ -1011,12 +1431,12 @@ export const ResourceManagement = WorkflowBuilder.create({
                     failureCondition: "status.phase == Error"
                 }
             })
-            .addRetryParameters(K8S_RESOURCE_RETRY_STRATEGY)
+            .addRetryParameters(K8S_INDEFINITE_RESOURCE_WAIT_RETRY_STRATEGY)
         )
     )
 
 
-    .addTemplate("waitForCaptureProxy", t => t
+    .addTemplate("waitIndefinitelyForCaptureProxy", t => t
         .addRequiredInput("resourceName", typeToken<string>())
         .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("checksumField", typeToken<string>())
@@ -1038,12 +1458,41 @@ export const ResourceManagement = WorkflowBuilder.create({
                     failureCondition: "status.phase == Error"
                 }
             })
-            .addRetryParameters(K8S_RESOURCE_RETRY_STRATEGY)
+            .addRetryParameters(K8S_INDEFINITE_RESOURCE_WAIT_RETRY_STRATEGY)
         )
     )
 
+    .addTemplate("waitIndefinitelyForTrafficSource", t => t
+        .addRequiredInput("sourceName", typeToken<string>())
+        .addRequiredInput("sourceKind", typeToken<"proxy" | "s3">())
+        .addRequiredInput("configChecksum", typeToken<string>())
+        .addInputsFromRecord(makeRequiredImageParametersForKeys(["MigrationConsole"]))
+        .addSteps(b => {
+            const isS3Source = expr.templateValue(expr.equals(b.inputs.sourceKind, expr.literal("s3")));
+            return b
+                .addStep("waitForCaptureProxy", INTERNAL, "waitIndefinitelyForCaptureProxy", c =>
+                    c.register({
+                        ...selectInputsForRegister(b, c),
+                        resourceName: b.inputs.sourceName,
+                        configChecksum: b.inputs.configChecksum,
+                        checksumField: expr.literal("checksumForReplayer"),
+                    }),
+                    {when: {templateExp: expr.not(isS3Source)}}
+                )
+                .addStep("waitForS3CapturedTraffic", INTERNAL, "waitIndefinitelyForCapturedTraffic", c =>
+                    c.register({
+                        ...selectInputsForRegister(b, c),
+                        resourceName: expr.concat(b.inputs.sourceName, expr.literal("-topic")),
+                        configChecksum: b.inputs.configChecksum,
+                        checksumField: expr.literal("checksumForReplayer"),
+                    }),
+                    {when: {templateExp: isS3Source}}
+                );
+        })
+    )
 
-    .addTemplate("waitForDataSnapshot", t => t
+
+    .addTemplate("waitIndefinitelyForDataSnapshot", t => t
         .addRequiredInput("resourceName", typeToken<string>())
         .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("checksumField", typeToken<string>())
@@ -1065,12 +1514,12 @@ export const ResourceManagement = WorkflowBuilder.create({
                     failureCondition: "status.phase == Error"
                 }
             })
-            .addRetryParameters(K8S_RESOURCE_RETRY_STRATEGY)
+            .addRetryParameters(K8S_INDEFINITE_RESOURCE_WAIT_RETRY_STRATEGY)
         )
     )
 
 
-    .addTemplate("waitForSnapshotMigration", t => t
+    .addTemplate("waitIndefinitelyForSnapshotMigration", t => t
         .addRequiredInput("resourceName", typeToken<string>())
         .addRequiredInput("configChecksum", typeToken<string>())
         .addRequiredInput("checksumField", typeToken<string>())
@@ -1092,7 +1541,7 @@ export const ResourceManagement = WorkflowBuilder.create({
                     failureCondition: "status.phase == Error"
                 }
             })
-            .addRetryParameters(K8S_RESOURCE_RETRY_STRATEGY)
+            .addRetryParameters(K8S_INDEFINITE_RESOURCE_WAIT_RETRY_STRATEGY)
         )
     )
 

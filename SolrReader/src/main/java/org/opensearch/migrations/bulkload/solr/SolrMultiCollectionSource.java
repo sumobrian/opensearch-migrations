@@ -37,32 +37,45 @@ public class SolrMultiCollectionSource implements DocumentSource {
     private final Map<String, JsonNode> schemas;
     private final Consumer<String> collectionPreparer;
     private final Consumer<SolrShardPartition> shardPreparer;
+    private final int solrMajorVersion;
+    private final Map<String, String> dataDirByCollection;
     private final ConcurrentHashMap<String, SolrBackupSource> sources = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> preparedCollections = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> preparedShards = new ConcurrentHashMap<>();
-
-    public SolrMultiCollectionSource(Path backupDir, Map<String, JsonNode> schemas) {
-        this(backupDir, schemas, null, null);
-    }
-
-    public SolrMultiCollectionSource(Path backupDir, Map<String, JsonNode> schemas, Consumer<String> collectionPreparer) {
-        this(backupDir, schemas, collectionPreparer, null);
-    }
 
     /**
      * @param collectionPreparer called once per collection name before first access.
      *                           Use this to download shard metadata on demand.
      * @param shardPreparer called once per shard partition before readDocuments.
      *                      Use this to download only the specific shard's index files.
+     * @param solrMajorVersion source Solr major version; selects the matching Lucene reader
+     *                         (6 → Lucene 6, 7 → Lucene 7, 8/9 → Lucene 9).
      */
     public SolrMultiCollectionSource(
         Path backupDir, Map<String, JsonNode> schemas,
-        Consumer<String> collectionPreparer, Consumer<SolrShardPartition> shardPreparer
+        Consumer<String> collectionPreparer, Consumer<SolrShardPartition> shardPreparer,
+        int solrMajorVersion
+    ) {
+        this(backupDir, schemas, collectionPreparer, shardPreparer, solrMajorVersion, Map.of());
+    }
+
+    /**
+     * @param dataDirByCollection maps a collection name to its backup data directory relative to
+     *                            {@code backupDir}. Lets a recovered/derived collection name (bare
+     *                            SolrCloud/standalone layouts) point at data that is not under a
+     *                            like-named subdirectory. Falls back to the collection name itself.
+     */
+    public SolrMultiCollectionSource(
+        Path backupDir, Map<String, JsonNode> schemas,
+        Consumer<String> collectionPreparer, Consumer<SolrShardPartition> shardPreparer,
+        int solrMajorVersion, Map<String, String> dataDirByCollection
     ) {
         this.backupDir = backupDir;
         this.schemas = schemas;
         this.collectionPreparer = collectionPreparer;
         this.shardPreparer = shardPreparer;
+        this.solrMajorVersion = solrMajorVersion;
+        this.dataDirByCollection = dataDirByCollection;
     }
 
     private void ensureCollectionPrepared(String collection) {
@@ -80,8 +93,9 @@ public class SolrMultiCollectionSource implements DocumentSource {
         return sources.computeIfAbsent(collection, c -> {
             var schema = schemas.get(c);
             var schemaNode = schema != null ? schema.path("schema") : schema;
-            var collectionDir = SolrBackupLayout.resolveCollectionDataDir(backupDir.resolve(c));
-            return new SolrBackupSource(collectionDir, c, schemaNode);
+            var dataDir = dataDirByCollection.getOrDefault(c, c);
+            var collectionDir = SolrBackupLayout.resolveCollectionDataDir(backupDir.resolve(dataDir));
+            return new SolrBackupSource(collectionDir, c, schemaNode, solrMajorVersion);
         });
     }
 

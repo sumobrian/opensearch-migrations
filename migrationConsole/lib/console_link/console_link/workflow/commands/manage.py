@@ -12,6 +12,7 @@ from kubernetes import client
 # Internal imports
 from .autocomplete_workflows import DEFAULT_WORKFLOW_NAME, get_workflow_completions
 from .argo_utils import DEFAULT_ARGO_SERVER_URL
+from .hints import hint_after_manage
 from ..models.utils import ExitCode, load_k8s_config, get_current_namespace
 from ..tui.manage_injections import make_argo_service, make_k8s_pod_scraper, WaiterInterface
 from ..tui.workflow_manage_app import WorkflowTreeApp
@@ -95,16 +96,23 @@ def _initialize_k8s_client(ctx):
 @click.option('--namespace', default=get_current_namespace, hidden=True, envvar='WORKFLOW_NAMESPACE')
 @click.option('--insecure', is_flag=True, default=True, hidden=True, envvar='WORKFLOW_INSECURE')
 @click.option('--token', hidden=True, envvar='ARGO_TOKEN')
+@click.option('--resource-view/--step-view', default=False, show_default='step-view',
+              help='Show the resource-centric view (--resource-view) or the current Argo '
+                   "Workflow's step tree (--step-view). The step tree does not show "
+                   'historical actions from prior runs.')
 @click.pass_context
-def manage_command(ctx, workflow_name, argo_server, namespace, insecure, token):
+def manage_command(ctx, workflow_name, argo_server, namespace, insecure, token, resource_view):
     _configure_file_logging()  # Configure logging when command actually runs
     try:
         app = WorkflowTreeApp(namespace, workflow_name,
                               make_argo_service(argo_server, insecure, token),
                               make_k8s_pod_scraper(_initialize_k8s_client(ctx)),
                               WaiterInterface.default(workflow_name, namespace),
-                              3.0)
+                              3.0,
+                              resource_view=resource_view)
         app.run()
     except Exception as e:
         click.echo(f"Error: {str(e)}", err=True)
         ctx.exit(ExitCode.FAILURE.value)
+
+    hint_after_manage(app.last_known_phase)

@@ -10,7 +10,8 @@
       "Bash(helm test:*)",
       "Bash(cat:*)",
       "Bash(kubectl get:*)",
-      "Bash(argo resume:*)"
+      "Bash(argo resume:*)",
+      "Bash(xargs ls)"
     ]
   }
 }

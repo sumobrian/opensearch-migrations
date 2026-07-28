@@ -9,6 +9,7 @@ dependencies {
     implementation project(":coreUtilities")
     implementation project(":RFS")
     implementation project(":SnapshotReader")
+    implementation project(":SnapshotReaderGcs")
     implementation project(":RfsPipeline")
     implementation project(":SolrReader")
     implementation project(":transformation")
@@ -28,6 +29,10 @@ dependencies {
     implementation libs.slf4j.api
     implementation libs.log4j.slf4j2.impl
 
+    // For failed document stream S3 sink (see RfsMigrateDocuments#buildFailedDocumentStreamSink)
+    implementation libs.aws.s3
+    implementation libs.aws.sdk.core
+
 
     testImplementation testFixtures(project(":RFS"))
     testImplementation testFixtures(project(":SolrReader"))
@@ -45,6 +50,7 @@ dependencies {
     testImplementation libs.testcontainers.opensearch
     testImplementation libs.testcontainers
     testImplementation libs.testcontainers.toxiproxy
+    testImplementation libs.testcontainers.localstack
     testImplementation libs.mockito.core
     testImplementation libs.mockito.junit.jupiter
     testImplementation libs.json

@@ -44,13 +44,15 @@ In a migration with replayer components deployed, the Migration Console has some
 
 The Reindex-From-Snapshot and Replayer services are deployed (if enabled) by the CDK scripts to ECS, in the same cluster as the Migration Console, or by the `docker-compose.yml` as Docker containers. In the AWS deployment, the Migration Console does not directly interact with either of these services. Instead, it uses the AWS API to manipulate them at the control-plane level by changing the number of desired services to disable, enable, and scale the services.
 
+Documents that fail terminally during a Reindex-from-Snapshot backfill are written to a failed document stream, which is durably persisted to S3. You can inspect it from the Migration Console. See [Failed Document Stream](failedDocumentStream.md).
+
 #### Shared Logs Volume
 
 In an AWS deployment, the Shared Logs Volume is an EFS volume that's mounted to the Migration Console task, as well as the Replayer task (if deployed).  In a Docker deployment, it's a shared volume between those containers. In both cases, logs are written to the volume from the Replayer (in the form of tuples) and processes on the Migration Console (specifically Metadata Migration). These logs can be accessed directly by the user (e.g. with shell commands `ls`, `cat`, `jq`, etc.) or, in the case of tuples, manipulated using Migration Console CLI commands.
 
 #### Cloudwatch Metrics
 
-The various services making up the Migration Assistant emit metrics and traces via an OpenTelemetry Collector to the configured metrics provider. In an AWS deployment, that's Cloudwatch & X-Ray, and in a Docker deployment it's Prometheus and Jaeger. The Migration Console contains basic functionality to query the metrics, and supports both the AWS and Docker deployment sources.
+The various services making up the Migration Assistant emit metrics and, when explicitly enabled, traces via OpenTelemetry Collector endpoints. In an AWS deployment, metrics go to CloudWatch and opt-in traces go to X-Ray; in a Docker deployment, metrics use Prometheus and opt-in traces can use Jaeger. The Migration Console contains basic functionality to query the metrics, and supports both the AWS and Docker deployment sources.
 
 ## Library Architecture and Interface
 

@@ -1,0 +1,613 @@
+import {
+    ARGO_MIGRATION_CONFIG_PRE_ENRICH,
+    collectProjectedFields,
+    ProjectedField,
+} from "@opensearch-migrations/schemas";
+import {createHash} from "crypto";
+import {z} from "zod";
+import {crdName} from "./crdNaming";
+import {FILE_SOURCE_RUNTIME_FIELDS, fileSourceRefsForTrace} from "./fileSourceUtils";
+
+type WorkflowConfig = z.infer<typeof ARGO_MIGRATION_CONFIG_PRE_ENRICH>;
+type KafkaClusterConfig = NonNullable<WorkflowConfig["kafkaClusters"]>[number];
+type ProxyConfig = WorkflowConfig["proxies"][number];
+type S3TrafficLoaderConfig = WorkflowConfig["s3TrafficLoaders"][number];
+type SnapshotConfig = WorkflowConfig["snapshots"][number];
+type SnapshotItemConfig = SnapshotConfig["createSnapshotConfig"][number];
+type SnapshotMigrationConfig = WorkflowConfig["snapshotMigrations"][number];
+type ReplayConfig = WorkflowConfig["trafficReplays"][number];
+
+export type ResolvedParameterPolicy = Pick<
+    ProjectedField,
+    "specPath" | "sourceSchema" | "sourcePath" | "changeRestriction" | "checksumFor" | "invariant"
+>;
+
+export interface ResolvedMigrationResource {
+    apiVersion: string;
+    kind: string;
+    name: string;
+    parameters: Record<string, unknown>;
+    annotations?: Record<string, string>;
+    parameterPolicies?: ResolvedParameterPolicy[];
+}
+
+export interface ResolvedMigrationResources {
+    formatVersion: 1;
+    workflowName?: string;
+    workflowConfig: WorkflowConfig;
+    resources: ResolvedMigrationResource[];
+}
+
+export interface ResolvedMigrationResourcesOptions {
+    includeParameterPolicies?: boolean;
+}
+
+export interface VapDryRunChange {
+    path: string;
+    previousValue?: unknown;
+    pendingValue?: unknown;
+    changeRestriction: "safe" | "gated" | "impossible";
+    invariant?: "nonDecreasing";
+    result: "allowed" | "approval-required" | "blocked";
+    message: string;
+}
+
+export interface VapDryRunResult {
+    kind: string;
+    name?: string;
+    allowed: boolean;
+    changes: VapDryRunChange[];
+}
+
+const CRD_API_VERSION = "migrations.opensearch.org/v1alpha1";
+
+function removeUndefined(value: unknown): unknown {
+    if (Array.isArray(value)) {
+        return value.map(removeUndefined);
+    }
+    if (typeof value !== "object" || value === null) {
+        return value;
+    }
+
+    return Object.fromEntries(
+        Object.entries(value)
+            .filter(([, child]) => child !== undefined)
+            .map(([key, child]) => [key, removeUndefined(child)])
+    );
+}
+
+function setPath(target: Record<string, unknown>, path: string[], value: unknown) {
+    let cursor: Record<string, unknown> = target;
+    for (let i = 0; i < path.length; i++) {
+        const key = path[i];
+        const isLast = i === path.length - 1;
+        if (isLast) {
+            cursor[key] = value;
+            return;
+        }
+        if (typeof cursor[key] !== "object" || cursor[key] === null || Array.isArray(cursor[key])) {
+            cursor[key] = {};
+        }
+        cursor = cursor[key] as Record<string, unknown>;
+    }
+}
+
+function hasPath(source: Record<string, unknown>, path: string[]): boolean {
+    let cursor: unknown = source;
+    for (const key of path) {
+        if (typeof cursor !== "object" || cursor === null || Array.isArray(cursor) || !(key in cursor)) {
+            return false;
+        }
+        cursor = (cursor as Record<string, unknown>)[key];
+    }
+    return true;
+}
+
+function getPath(source: Record<string, unknown>, path: string[]): unknown {
+    let cursor: unknown = source;
+    for (const key of path) {
+        if (typeof cursor !== "object" || cursor === null || Array.isArray(cursor)) {
+            return undefined;
+        }
+        cursor = (cursor as Record<string, unknown>)[key];
+    }
+    return cursor;
+}
+
+function stableEqual(left: unknown, right: unknown): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
+}
+
+// Default-less optional string fields that the apply manifests always write with an "" default
+// (via expr.dig(..., "")), but which are absent from the resolved config when the user omits them.
+// Fill them here so the resolved-resource parameters (MigrationRun history + dry-run preview) match
+// the spec actually applied to the live CR. Keep in sync with the "" defaults in resourceManagement.ts.
+const CREATE_SNAPSHOT_EMPTY_STRING_DEFAULT_FIELDS = ["otelTraceCollectorEndpoint"] as const;
+const METADATA_EMPTY_STRING_DEFAULT_FIELDS =
+    ["otelTraceCollectorEndpoint", "transformerConfig", "transformerConfigFile"] as const;
+const DOCUMENT_BACKFILL_EMPTY_STRING_DEFAULT_FIELDS =
+    ["otelTraceCollectorEndpoint", "docTransformerConfig", "docTransformerConfigFile"] as const;
+
+function withEmptyStringDefaults(
+    value: Record<string, unknown> | undefined,
+    fields: readonly string[],
+): Record<string, unknown> {
+    const result: Record<string, unknown> = {...(value ?? {})};
+    for (const field of fields) {
+        if (result[field] === undefined) {
+            result[field] = "";
+        }
+    }
+    return result;
+}
+
+function prefixFields(prefix: string, value: Record<string, unknown> | undefined): Record<string, unknown> {
+    if (!value) {
+        return {};
+    }
+    return Object.fromEntries(
+        Object.entries(value).map(([key, child]) => [
+            `${prefix}${key.charAt(0).toUpperCase()}${key.slice(1)}`,
+            child,
+        ])
+    );
+}
+
+function prefixedKey(prefix: string, field: string): string {
+    return `${prefix}${field.charAt(0).toUpperCase()}${field.slice(1)}`;
+}
+
+function connectionIdentityParameters(
+    prefix: string,
+    identity: Record<string, unknown>,
+    options: {includeVersion?: boolean} = {},
+): Record<string, unknown> {
+    return {
+        [prefixedKey(prefix, "label")]: identity.label,
+        ...(options.includeVersion === false ? {} : {[prefixedKey(prefix, "version")]: identity.version}),
+        [prefixedKey(prefix, "endpoint")]: identity.endpoint,
+        [prefixedKey(prefix, "allowInsecure")]: identity.allowInsecure,
+        [prefixedKey(prefix, "authType")]: identity.authType,
+        [prefixedKey(prefix, "authBasicSecretName")]: identity.authBasicSecretName,
+        [prefixedKey(prefix, "authSigv4Region")]: identity.authSigv4Region,
+        [prefixedKey(prefix, "authSigv4Service")]: identity.authSigv4Service,
+        [prefixedKey(prefix, "authMtlsClientSecretName")]: identity.authMtlsClientSecretName,
+        [prefixedKey(prefix, "authMtlsCaCertHash")]: identity.authMtlsCaCertHash,
+    };
+}
+
+function kafkaClientIdentityParameters(kafkaConfig: Record<string, unknown>): Record<string, unknown> {
+    return {
+        kafkaBrokers: kafkaConfig.kafkaConnection,
+        kafkaManagedByWorkflow: kafkaConfig.managedByWorkflow,
+        kafkaAuthType: kafkaConfig.authType,
+        kafkaEnableMSKAuth: kafkaConfig.enableMSKAuth,
+        kafkaSecretName: kafkaConfig.secretName,
+        kafkaCaSecretName: kafkaConfig.caSecretName,
+        kafkaUserName: kafkaConfig.kafkaUserName,
+    };
+}
+
+function repoIdentityParameters(prefix: string, repo: Record<string, unknown>): Record<string, unknown> {
+    return {
+        [prefixedKey(prefix, "repoName")]: repo.repoName,
+        [prefixedKey(prefix, "repoPathUri")]: repo.repoPathUri,
+        [prefixedKey(prefix, "repoAwsRegion")]: repo.awsRegion,
+        [prefixedKey(prefix, "repoEndpoint")]: repo.endpoint,
+        [prefixedKey(prefix, "repoS3RoleArn")]: repo.s3RoleArn,
+        [prefixedKey(prefix, "repoUseLocalStack")]: repo.useLocalStack,
+    };
+}
+
+function snapshotSourceType(snapshotNameResolution: Record<string, unknown>): string {
+    const hasDataSnapshot = "dataSnapshotResourceName" in snapshotNameResolution;
+    const hasExternalSnapshot = "externalSnapshotName" in snapshotNameResolution;
+    if (hasDataSnapshot && hasExternalSnapshot) {
+        return "externalPrepared";
+    }
+    return hasDataSnapshot ? "dataSnapshot" : "external";
+}
+
+const CAPTURE_PROXY_RESOURCE_OMITTED_FIELDS = [
+    // Workflow/deployment bridge fields. The CaptureProxy CRD does not own these
+    // until the resource controller grows file-source-aware mTLS support.
+    ...FILE_SOURCE_RUNTIME_FIELDS,
+    "sslTrustCertFile",
+    "sslTrustCertPem",
+    "sslTrustCertPemEnvVar",
+    "requireClientAuth",
+] as const;
+
+const WORKFLOW_ONLY_FIELDS_ANNOTATION = "migrations.opensearch.org/workflow-only-fields";
+const WORKFLOW_ONLY_HASH_ANNOTATION = "migrations.opensearch.org/workflow-only-hash";
+const FILE_SOURCE_REFS_ANNOTATION = "migrations.opensearch.org/file-source-refs";
+
+function omitFields(source: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
+    const result = {...source};
+    for (const field of fields) {
+        delete result[field];
+    }
+    return result;
+}
+
+function isNonEmptyTraceValue(value: unknown): boolean {
+    if (value === undefined) {
+        return false;
+    }
+    if (Array.isArray(value)) {
+        return value.length > 0;
+    }
+    return true;
+}
+
+function pickFields(source: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
+    for (const field of fields) {
+        if (field in source && isNonEmptyTraceValue(source[field])) {
+            result[field] = source[field];
+        }
+    }
+    return result;
+}
+
+function traceHash(value: unknown) {
+    return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
+function workflowOnlyTraceAnnotations(omittedFields: Record<string, unknown>) {
+    const fields = Object.keys(omittedFields);
+    if (fields.length === 0) {
+        return undefined;
+    }
+
+    const annotations: Record<string, string> = {
+        [WORKFLOW_ONLY_FIELDS_ANNOTATION]: fields.join(","),
+        [WORKFLOW_ONLY_HASH_ANNOTATION]: traceHash(omittedFields),
+    };
+    const fileSourceRefs = fileSourceRefsForTrace(omittedFields);
+    if (fileSourceRefs.length > 0) {
+        annotations[FILE_SOURCE_REFS_ANNOTATION] = JSON.stringify(fileSourceRefs);
+    }
+    return annotations;
+}
+
+function resourcePolicies(kind: string, parameters: Record<string, unknown>): ResolvedParameterPolicy[] {
+    return collectProjectedFields()
+        .filter(field => field.resourceKind === kind && hasPath(parameters, field.specPath))
+        .map(({specPath, sourceSchema, sourcePath, changeRestriction, checksumFor, invariant}) => ({
+            specPath,
+            sourceSchema,
+            sourcePath,
+            changeRestriction,
+            checksumFor,
+            invariant,
+        }));
+}
+
+function resource(
+    kind: string,
+    name: string,
+    parameters: Record<string, unknown>,
+    options: ResolvedMigrationResourcesOptions = {},
+    annotations?: Record<string, string>,
+): ResolvedMigrationResource {
+    const normalizedParameters = removeUndefined(parameters) as Record<string, unknown>;
+    return {
+        apiVersion: CRD_API_VERSION,
+        kind,
+        name,
+        parameters: normalizedParameters,
+        ...(annotations === undefined ? {} : {annotations}),
+        ...(options.includeParameterPolicies
+            ? {parameterPolicies: resourcePolicies(kind, normalizedParameters)}
+            : {}),
+    };
+}
+
+function kafkaClusterParameters(kafkaCluster: KafkaClusterConfig): Record<string, unknown> {
+    const config = (kafkaCluster.config ?? {}) as Record<string, any>;
+    const nodePool = config.nodePoolSpecOverrides ?? {};
+    const storage = nodePool.storage ?? {};
+    const parameters: Record<string, unknown> = {
+        version: kafkaCluster.version,
+        clusterSpecOverrides: config.clusterSpecOverrides ?? {},
+        nodePoolSpecOverrides: nodePool,
+    };
+    setPath(parameters, ["auth", "type"], config.auth?.type);
+    setPath(parameters, ["nodePool", "replicas"], nodePool.replicas);
+    setPath(parameters, ["nodePool", "roles"], nodePool.roles);
+    setPath(parameters, ["nodePool", "storage", "size"], storage.size);
+    setPath(parameters, ["nodePool", "storage", "type"], storage.type);
+    return parameters;
+}
+
+function capturedTrafficParameters(proxy: ProxyConfig): Record<string, unknown> {
+    return {
+        dependsOn: [proxy.kafkaConfig.label],
+        kafkaClusterName: proxy.kafkaConfig.label,
+        ...kafkaClientIdentityParameters(proxy.kafkaConfig as Record<string, unknown>),
+        topicName: proxy.kafkaConfig.kafkaTopic,
+        partitions: proxy.kafkaConfig.topicSpecOverrides?.partitions,
+        replicas: proxy.kafkaConfig.topicSpecOverrides?.replicas,
+        topicConfig: proxy.kafkaConfig.topicSpecOverrides?.config,
+        sourceLabel: proxy.sourceConfig.label,
+        sourceKind: "proxy",
+        s3SourceUri: "",
+        loadStarted: true,
+    };
+}
+
+function s3CapturedTrafficParameters(loader: S3TrafficLoaderConfig): Record<string, unknown> {
+    return {
+        dependsOn: [loader.kafkaConfig.label],
+        kafkaClusterName: loader.kafkaConfig.label,
+        ...kafkaClientIdentityParameters(loader.kafkaConfig as Record<string, unknown>),
+        topicName: loader.kafkaConfig.kafkaTopic,
+        partitions: loader.kafkaConfig.topicSpecOverrides?.partitions,
+        replicas: loader.kafkaConfig.topicSpecOverrides?.replicas,
+        topicConfig: loader.kafkaConfig.topicSpecOverrides?.config,
+        sourceLabel: loader.sourceLabel,
+        sourceKind: "s3",
+        s3SourceUri: loader.s3Uri,
+        loadStarted: true,
+    };
+}
+
+function captureProxyParameters(proxy: ProxyConfig): Record<string, unknown> {
+    return {
+        ...connectionIdentityParameters(
+            "source",
+            proxy.sourceConnectionIdentity as Record<string, unknown>,
+            {includeVersion: true}
+        ),
+        serviceType: proxy.proxyConfig.serviceType,
+        ...omitFields(proxy.proxyConfig as Record<string, unknown>, CAPTURE_PROXY_RESOURCE_OMITTED_FIELDS),
+        dependsOn: [`${proxy.name}-topic`],
+    };
+}
+
+function captureProxyAnnotations(proxy: ProxyConfig) {
+    const omittedFields = pickFields(
+        proxy.proxyConfig as Record<string, unknown>,
+        CAPTURE_PROXY_RESOURCE_OMITTED_FIELDS
+    );
+    return workflowOnlyTraceAnnotations(omittedFields);
+}
+
+function dataSnapshotParameters(item: SnapshotItemConfig): Record<string, unknown> {
+    const snapshotConfig = item.config as Record<string, unknown>;
+    const sourceIdentity = item.sourceConnectionIdentity as Record<string, unknown>;
+    const repo = item.repo;
+    return {
+        ...connectionIdentityParameters("source", sourceIdentity, {includeVersion: true}),
+        snapshotLabel: item.label,
+        repoName: repo.repoName,
+        repoPathUri: repo.repoPathUri,
+        repoAwsRegion: repo.awsRegion,
+        repoEndpoint: repo.endpoint,
+        repoS3RoleArn: repo.s3RoleArn,
+        repoUseLocalStack: repo.useLocalStack,
+        snapshotPrefix: item.snapshotPrefix,
+        mode: snapshotConfig.mode ?? "create",
+        solrExternalBackupName: item.solrExternalBackupName ?? "",
+        ...withEmptyStringDefaults(snapshotConfig, CREATE_SNAPSHOT_EMPTY_STRING_DEFAULT_FIELDS),
+        dependsOn: (item.dependsOnProxySetups ?? []).map(dep => dep.name),
+    };
+}
+
+function snapshotMigrationParameters(migration: SnapshotMigrationConfig): Record<string, unknown> {
+    const snapshotNameResolution = migration.snapshotNameResolution as Record<string, unknown>;
+    const dataSnapshotResourceName =
+        "dataSnapshotResourceName" in snapshotNameResolution
+            ? snapshotNameResolution.dataSnapshotResourceName
+            : "";
+    const externalSnapshotName =
+        "externalSnapshotName" in snapshotNameResolution
+            ? snapshotNameResolution.externalSnapshotName
+            : "";
+    const repo = migration.snapshotConfig.repoConfig as Record<string, unknown>;
+    return {
+        ...prefixFields("metadataMigration", migration.metadataMigrationConfig
+            ? withEmptyStringDefaults(migration.metadataMigrationConfig as Record<string, unknown>, METADATA_EMPTY_STRING_DEFAULT_FIELDS)
+            : undefined),
+        ...prefixFields("documentBackfill", migration.documentBackfillConfig
+            ? withEmptyStringDefaults(migration.documentBackfillConfig as Record<string, unknown>, DOCUMENT_BACKFILL_EMPTY_STRING_DEFAULT_FIELDS)
+            : undefined),
+        dependsOn: dataSnapshotResourceName ? [dataSnapshotResourceName] : [],
+        migrationLabel: migration.migrationLabel,
+        ...connectionIdentityParameters(
+            "source",
+            migration.sourceConnectionIdentity as Record<string, unknown>,
+            {includeVersion: true}
+        ),
+        ...connectionIdentityParameters(
+            "target",
+            migration.targetConnectionIdentity as Record<string, unknown>,
+            {includeVersion: false}
+        ),
+        snapshotLabel: migration.label,
+        snapshotSourceType: snapshotSourceType(snapshotNameResolution),
+        dataSnapshotResourceName,
+        externalSnapshotName,
+        ...repoIdentityParameters("snapshot", repo),
+    };
+}
+
+function trafficReplayParameters(replay: ReplayConfig): Record<string, unknown> {
+    return {
+        ...replay.replayerConfig,
+        dependsOn: replay.dependsOn,
+        fromCapturedTraffic: replay.fromCapturedTraffic,
+        fromCapturedTrafficSourceKind: replay.fromCapturedTrafficSourceKind,
+        sourceLabel: replay.sourceLabel,
+        ...connectionIdentityParameters(
+            "target",
+            replay.targetConnectionIdentity as Record<string, unknown>,
+            {includeVersion: false}
+        ),
+    };
+}
+
+export function buildResolvedMigrationResourceList(
+    workflowConfig: WorkflowConfig,
+    options: ResolvedMigrationResourcesOptions = {},
+): ResolvedMigrationResource[] {
+    const resources: ResolvedMigrationResource[] = [];
+
+    for (const kafkaCluster of workflowConfig.kafkaClusters ?? []) {
+        resources.push(resource("KafkaCluster", kafkaCluster.name, kafkaClusterParameters(kafkaCluster), options));
+    }
+
+    for (const proxy of workflowConfig.proxies ?? []) {
+        resources.push(resource("CapturedTraffic", `${proxy.name}-topic`, capturedTrafficParameters(proxy), options));
+        resources.push(resource(
+            "CaptureProxy",
+            proxy.name,
+            captureProxyParameters(proxy),
+            options,
+            captureProxyAnnotations(proxy)
+        ));
+    }
+
+    for (const loader of workflowConfig.s3TrafficLoaders ?? []) {
+        resources.push(resource("CapturedTraffic", `${loader.name}-topic`, s3CapturedTrafficParameters(loader), options));
+    }
+
+    for (const snapshot of workflowConfig.snapshots ?? []) {
+        for (const item of snapshot.createSnapshotConfig) {
+            resources.push(resource(
+                "DataSnapshot",
+                crdName(snapshot.sourceConfig.label, item.label),
+                dataSnapshotParameters(item),
+                options,
+            ));
+        }
+    }
+
+    for (const migration of workflowConfig.snapshotMigrations ?? []) {
+        resources.push(resource(
+            "SnapshotMigration",
+            [
+                migration.sourceLabel,
+                migration.targetConfig.label,
+                migration.label,
+                migration.migrationLabel,
+            ].join("-"),
+            snapshotMigrationParameters(migration),
+            options,
+        ));
+    }
+
+    for (const replay of workflowConfig.trafficReplays ?? []) {
+        resources.push(resource("TrafficReplay", replay.name, trafficReplayParameters(replay), options));
+    }
+
+    return resources;
+}
+
+export function buildResolvedMigrationResources(
+    workflowConfig: WorkflowConfig,
+    workflowName?: string,
+    options: ResolvedMigrationResourcesOptions = {},
+): ResolvedMigrationResources {
+    return {
+        formatVersion: 1,
+        ...(workflowName ? {workflowName} : {}),
+        workflowConfig,
+        resources: buildResolvedMigrationResourceList(workflowConfig, options),
+    };
+}
+
+export function dryRunResourcePolicy(
+    previous: Pick<ResolvedMigrationResource, "kind" | "name" | "parameters">,
+    pending: Pick<ResolvedMigrationResource, "kind" | "name" | "parameters">,
+    options: {approved?: boolean} = {}
+): VapDryRunResult {
+    if (previous.kind !== pending.kind) {
+        throw new Error(`Cannot compare ${previous.kind} to ${pending.kind}`);
+    }
+
+    const changes: VapDryRunChange[] = [];
+    // This mirrors the field-level ValidatingAdmissionPolicy generator in
+    // @opensearch-migrations/schemas/generateMigrationResources.ts. Both paths
+    // consume collectProjectedFields(), so the same spec paths, changeRestriction
+    // values, and invariants drive the real CEL rules and this local preview.
+    //
+    // The dry run intentionally models only parameter update admission:
+    // lifecycle guards such as lock-on-complete and deleting-phase checks depend
+    // on live CR status and are evaluated by Kubernetes at apply time. The
+    // generated VAP also allows initial spec population while old phase is
+    // Created; historical comparisons are made after that initial population.
+    for (const field of collectProjectedFields().filter(field => field.resourceKind === pending.kind)) {
+            const previousHasValue = hasPath(previous.parameters, field.specPath);
+            const pendingHasValue = hasPath(pending.parameters, field.specPath);
+            const previousValue = getPath(previous.parameters, field.specPath);
+            const pendingValue = getPath(pending.parameters, field.specPath);
+            if (previousHasValue === pendingHasValue && stableEqual(previousValue, pendingValue)) {
+                continue;
+            }
+
+            const path = field.specPath.join(".");
+            // Non-decreasing invariants are emitted as their own CEL rule before
+            // gated approval is considered, so approval cannot override a decrease.
+            if (field.invariant === "nonDecreasing" && previousHasValue && pendingHasValue &&
+                typeof previousValue === "number" && typeof pendingValue === "number" &&
+                pendingValue < previousValue) {
+                changes.push({
+                    path,
+                    previousValue,
+                    pendingValue,
+                    changeRestriction: field.changeRestriction,
+                    invariant: field.invariant,
+                    result: "blocked" as const,
+                    message: `${path} cannot decrease.`,
+                });
+                continue;
+            }
+            // "impossible" fields are generated as equality-only CEL rules: the
+            // pending value must remain absent or equal to the old value.
+            if (field.changeRestriction === "impossible") {
+                changes.push({
+                    path,
+                    previousValue,
+                    pendingValue,
+                    changeRestriction: field.changeRestriction,
+                    invariant: field.invariant,
+                    result: "blocked" as const,
+                    message: `${path} cannot be changed. Delete and recreate.`,
+                });
+                continue;
+            }
+            // "gated" fields use the same equality-or-approval shape as the VAP:
+            // unchanged values pass, changed values require an ApprovalGate for
+            // the workflow run. The caller supplies that approval state here.
+            if (field.changeRestriction === "gated" && !options.approved) {
+                changes.push({
+                    path,
+                    previousValue,
+                    pendingValue,
+                    changeRestriction: field.changeRestriction,
+                    invariant: field.invariant,
+                    result: "approval-required" as const,
+                    message: `${path} requires an ApprovalGate for this workflow run.`,
+                });
+                continue;
+            }
+            changes.push({
+                path,
+                previousValue,
+                pendingValue,
+                changeRestriction: field.changeRestriction,
+                invariant: field.invariant,
+                result: "allowed" as const,
+                message: `${path} is allowed.`,
+            });
+    }
+
+    return {
+        kind: pending.kind,
+        name: pending.name,
+        allowed: changes.every(change => change.result === "allowed"),
+        changes,
+    };
+}

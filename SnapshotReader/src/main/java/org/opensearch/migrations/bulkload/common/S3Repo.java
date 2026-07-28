@@ -8,6 +8,8 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletionException;
 
+import org.opensearch.migrations.bulkload.solr.SolrBackupLayout;
+
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
@@ -20,7 +22,7 @@ import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
 @Slf4j
-public class S3Repo implements SourceRepo {
+public class S3Repo implements SourceRepo, AutoCloseable {
     private static final double S3_TARGET_THROUGHPUT_GIBPS = 8.0; // Arbitrarily chosen
     private static final long S3_MAX_MEMORY_BYTES = 1024L * 1024 * 1024; // Arbitrarily chosen
     private static final long S3_MINIMUM_PART_SIZE_BYTES = 8L * 1024 * 1024; // Default, but be explicit
@@ -37,6 +39,13 @@ public class S3Repo implements SourceRepo {
     @Override
     public String toString() {
         return String.format("S3Repo [uri=%s, region=%s]", s3RepoUri.uri, s3Region);
+    }
+
+    @Override
+    public void close() {
+        if (s3Client != null) {
+            s3Client.close();
+        }
     }
 
     protected void ensureS3LocalDirectoryExists(Path localPath) {
@@ -69,7 +78,15 @@ public class S3Repo implements SourceRepo {
                 .key(s3Uri.key)
                 .build();
 
-        s3Client.getObject(getObjectRequest, AsyncResponseTransformer.toFile(localPath)).join();
+        try {
+            s3Client.getObject(getObjectRequest, AsyncResponseTransformer.toFile(localPath)).join();
+        } catch (CompletionException e) {
+            // A failed download (missing object, access denied, or a transient S3 error that
+            // exhausted the client's retries) is a non-retriable snapshot read failure. Classify it
+            // so the worker surfaces the snapshot path + cause and exits with the dedicated code
+            // instead of dying with a generic, unlabeled error.
+            throw new CouldNotReadFromS3(s3Uri.bucketName, s3Uri.key, e);
+        }
     }
 
     public static S3Repo create(Path s3LocalDir, S3Uri s3Uri, String s3Region, SnapshotFileFinder finder) {
@@ -145,7 +162,7 @@ public class S3Repo implements SourceRepo {
     }
 
 
-    public static class CannotFindSnapshotRepoRoot extends RfsException {
+    public static class CannotFindSnapshotRepoRoot extends RfsException implements SnapshotReadFailure {
         public CannotFindSnapshotRepoRoot(String bucket, String prefix) {
             super("Cannot find the snapshot repository root in S3 bucket: " + bucket + ", prefix: " + prefix);
         }
@@ -191,7 +208,7 @@ public class S3Repo implements SourceRepo {
         return new S3Uri(fullUri);
     }
 
-    protected List<String> listFilesInS3Root() {
+    public List<String> listFilesInS3Root() {
         // Normalise the repository prefix and remove trailing “/” if present
         String prefixKey = s3RepoUri.key;
         if (prefixKey.endsWith("/")) {
@@ -234,9 +251,15 @@ public class S3Repo implements SourceRepo {
         return strippedKeys;
     }
 
-    public static class CannotListObjectsInS3 extends RfsException {
+    public static class CannotListObjectsInS3 extends RfsException implements SnapshotReadFailure {
         public CannotListObjectsInS3(String bucket, String prefix, Throwable cause) {
             super("Failed to list objects in S3 bucket: " + bucket + ", prefix: " + prefix, cause);
+        }
+    }
+
+    public static class CouldNotReadFromS3 extends RfsException implements SnapshotReadFailure {
+        public CouldNotReadFromS3(String bucket, String key, Throwable cause) {
+            super("Failed to read object from S3 bucket: " + bucket + ", key: " + key, cause);
         }
     }
 
@@ -248,6 +271,22 @@ public class S3Repo implements SourceRepo {
      */
     public List<String> listTopLevelDirectories() {
         return listSubDirectories("");
+    }
+
+    /**
+     * Adapts this repo to {@link SolrBackupLayout#detectBareLayout}.
+     * @return the bare layout, or {@code null} if the root is not a bare single-collection backup
+     */
+    public SolrBackupLayout.BareBackupLayout detectBareSolrLayout() {
+        return SolrBackupLayout.detectBareLayout(
+            this::listTopLevelDirectories,
+            this::listFilesInS3Root,
+            () -> {
+                downloadFile("backup.properties");
+                return getRepoRootDir();
+            },
+            () -> getS3RepoUri().key
+        );
     }
 
     /**

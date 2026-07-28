@@ -24,10 +24,13 @@ from ..tree_utils import (
     display_workflow_tree,
     get_node_input_parameter,
     overlay_approval_gate_status,
+    overlay_data_snapshot_creation_status,
+    overlay_snapshot_migration_backfill_status,
     WorkflowDisplayer
 )
 from .autocomplete_workflows import DEFAULT_WORKFLOW_NAME, get_workflow_completions
 from .argo_utils import DEFAULT_ARGO_SERVER_URL
+from .hints import hint_after_status
 from console_link.environment import Environment
 from console_link.middleware import snapshot as snapshot_middleware
 from console_link.middleware import backfill as backfill_middleware
@@ -47,15 +50,15 @@ class StatusCommandHandler:
 
     def handle_status_command(self, workflow_name: Optional[str], argo_server: str,
                               namespace: str, insecure: bool,
-                              show_all: bool, live_check: bool) -> None:
-        """Handle the main status command logic."""
+                              show_all: bool, live_check: bool) -> Optional[str]:
+        """Handle the main status command logic and return the displayed phase, if singular."""
         try:
             if workflow_name:
-                self._handle_single_workflow(workflow_name, argo_server, namespace,
-                                             insecure, live_check)
+                return self._handle_single_workflow(workflow_name, argo_server, namespace,
+                                                    insecure, live_check)
             else:
-                self._handle_workflow_list(show_all, argo_server, namespace,
-                                           insecure, live_check)
+                return self._handle_workflow_list(show_all, argo_server, namespace,
+                                                  insecure, live_check)
         except click.Abort:
             raise
         except Exception as e:
@@ -63,7 +66,7 @@ class StatusCommandHandler:
             raise click.Abort()
 
     def _handle_single_workflow(self, workflow_name: str, argo_server: str,
-                                namespace: str, insecure: bool, live_check: bool) -> None:
+                                namespace: str, insecure: bool, live_check: bool) -> Optional[str]:
         """Handle status display for a specific workflow."""
         workflow_data = self.data_fetcher.get_workflow_data(
             workflow_name, argo_server, namespace, insecure)
@@ -76,17 +79,16 @@ class StatusCommandHandler:
             )
             raise click.Abort()
 
-        self._display_workflow_with_tree(workflow_data, live_check, argo_server, namespace, insecure)
+        return self._display_workflow_with_tree(workflow_data, live_check, argo_server, namespace, insecure)
 
     def _handle_workflow_list(self, show_all: bool, argo_server: str, namespace: str,
-                              insecure: bool, live_check: bool) -> None:
+                              insecure: bool, live_check: bool) -> Optional[str]:
         """Handle status display for workflow list."""
         workflow_list = self.data_fetcher.list_workflows(
             argo_server, namespace, insecure, exclude_completed=not show_all)
 
         if not workflow_list:
-            self._handle_no_workflows(show_all, argo_server, namespace, insecure, live_check)
-            return
+            return self._handle_no_workflows(show_all, argo_server, namespace, insecure, live_check)
 
         click.echo(f"Found {len(workflow_list)} workflow(s) in namespace {namespace}:")
         click.echo("")
@@ -100,13 +102,14 @@ class StatusCommandHandler:
                 f"{workflow_name}"
             )
             self._display_workflow_with_tree(workflow_data, live_check, argo_server, namespace, insecure)
+        return None
 
     def _handle_no_workflows(self, show_all: bool, argo_server: str, namespace: str,
-                             insecure: bool, live_check: bool) -> None:
+                             insecure: bool, live_check: bool) -> Optional[str]:
         """Handle case when no active workflows are found."""
         if show_all:
             click.echo(f"No workflows found in namespace {namespace}")
-            return
+            return None
 
         click.echo(f"No running workflows found in namespace {namespace}")
 
@@ -116,13 +119,16 @@ class StatusCommandHandler:
 
         if all_workflows:
             most_recent = self.sorter.find_most_recent_completed(all_workflows)
+            phase = None
             if most_recent:
                 click.echo("\nShowing last completed workflow:\n")
-                self._display_workflow_with_tree(most_recent, live_check, argo_server, namespace, insecure)
+                phase = self._display_workflow_with_tree(most_recent, live_check, argo_server, namespace, insecure)
 
             click.echo("\nUse --all to see all completed workflows")
+            return phase if most_recent else None
         else:
             click.echo("Use --all to see completed workflows")
+            return None
 
     def _get_workflow_name(self, workflow_data: Dict[str, Any]) -> str:
         """Extract workflow name from workflow data."""
@@ -130,13 +136,15 @@ class StatusCommandHandler:
 
     def _display_workflow_with_tree(self, workflow_data: Dict[str, Any], live_check: bool,
                                     argo_server: str = "", namespace: str = "",
-                                    insecure: bool = False) -> None:
+                                    insecure: bool = False) -> str:
         """Display workflow using tree structure with optional live status checks."""
         tree_nodes = build_nested_workflow_tree(workflow_data)
         if live_check:
             self.live_check_processor.enrich_tree_with_live_checks(tree_nodes)
         filtered_tree = filter_tree_nodes(tree_nodes)
         overlay_approval_gate_status(filtered_tree, namespace)
+        overlay_data_snapshot_creation_status(filtered_tree, namespace)
+        overlay_snapshot_migration_backfill_status(filtered_tree, namespace)
 
         # Create a lazy resolver — artifacts are only fetched when a node is
         # actually rendered and has an artifact output (not eagerly for all nodes).
@@ -149,15 +157,17 @@ class StatusCommandHandler:
         # Extract status info from workflow data
         status = workflow_data.get('status', {})
         metadata = workflow_data.get('metadata', {})
+        phase = status.get('phase', 'Unknown')
 
         self.displayer.display_workflow_status(
             metadata.get('name', 'unknown'),
-            status.get('phase', 'Unknown'),
+            phase,
             status.get('startedAt'),
             status.get('finishedAt'),
             filtered_tree,
             workflow_data,
             artifact_resolver=artifact_resolver)
+        return phase
 
 
 class WorkflowDataFetcher:
@@ -389,7 +399,7 @@ class LiveCheckProcessor:
                 display_name = node.get('display_name', '')
                 node_name = display_name.split('(')[0] if '(' in display_name else display_name
 
-                if node_name in ('createSnapshot', 'bulkLoadDocuments'):
+                if node_name in ('createSnapshot', 'bulkLoadDocuments', 'checkBackfillStatus'):
                     yield node
                 else:
                     yield from find_intermediate_nodes(node.get('children', []))
@@ -422,8 +432,12 @@ class LiveCheckProcessor:
     def _has_status_output(self, node: Dict[str, Any]) -> bool:
         """Check if node has statusOutput parameter and configContents."""
         has_config = get_node_input_parameter(node, 'configContents') is not None
-        outputs = node.get('outputs', {}).get('parameters', [])
-        has_status_output = any(p.get('name') == 'statusOutput' for p in outputs)
+        outputs_params = node.get('outputs', {}).get('parameters', [])
+        outputs_artifacts = node.get('outputs', {}).get('artifacts', [])
+        has_status_output = (
+            any(p.get('name') == 'statusOutput' for p in outputs_params) or
+            any(a.get('name') == 'statusOutput' for a in outputs_artifacts)
+        )
         return has_config and has_status_output and node.get('type') == 'Pod'
 
     def _run_live_checks_parallel(self, in_progress_nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -476,10 +490,15 @@ class LiveCheckProcessor:
 @click.option('--token', hidden=True, envvar='ARGO_TOKEN', help='Bearer token for authentication')
 @click.option('--all', 'show_all', is_flag=True, default=False,
               help='Show all workflows including completed ones (default: only running)')
-@click.option('--live-status', is_flag=True, default=False,
+@click.option('--live-status/--no-live-status', default=True,
               help='Run a current status check for each snapshot and backfill still running')
+@click.option('--resource-view/--step-view', default=False, show_default='step-view',
+              help='Show the resource-centric view (--resource-view) or the current Argo '
+                   "Workflow's step tree (--step-view). The step tree does not show "
+                   'historical actions from prior runs.')
 @click.pass_context
-def status_command(ctx, workflow_name, all_workflows, argo_server, namespace, insecure, token, show_all, live_status):
+def status_command(ctx, workflow_name, all_workflows, argo_server, namespace, insecure, token, show_all, live_status,
+                   resource_view):
     """Show detailed status of workflows.
 
     Displays workflow progress, completed steps, and approval status.
@@ -489,7 +508,65 @@ def status_command(ctx, workflow_name, all_workflows, argo_server, namespace, in
     Example:
         workflow status
         workflow status --all
+        workflow status --resource-view
     """
+    if resource_view:
+        _run_resource_view(ctx, workflow_name, argo_server, namespace, insecure, token, live_status)
+    else:
+        _run_step_view(ctx, workflow_name, all_workflows, argo_server, namespace, insecure, token,
+                       show_all, live_status)
+
+
+def _run_resource_view(ctx, workflow_name, argo_server, namespace, insecure, token, live_status):
+    """Display the resource-centric status view."""
+    try:
+        from ..resource_tree import (
+            build_resource_tree, display_resource_tree,
+            extract_workflow_steps_by_resource, mark_not_configured_groups,
+        )
+        from ..models.utils import load_k8s_config
+        from ..tree_utils import build_nested_workflow_tree, filter_tree_nodes
+        load_k8s_config()
+        sections = build_resource_tree(namespace)
+
+        workflow_unavailable = False
+        try:
+            service = WorkflowService()
+            fetcher = WorkflowDataFetcher(service, token)
+            workflow_data = fetcher.get_workflow_data(
+                workflow_name, argo_server, namespace, insecure)
+            if workflow_data and workflow_data.get('status', {}).get('nodes'):
+                tree_nodes = build_nested_workflow_tree(workflow_data)
+                filtered_tree = filter_tree_nodes(tree_nodes)
+                steps = extract_workflow_steps_by_resource(filtered_tree)
+                _assign_workflow_progress(sections, steps)
+                mark_not_configured_groups(sections, filtered_tree)
+            elif not workflow_data:
+                workflow_unavailable = True
+        except Exception:
+            workflow_unavailable = True
+
+        display_resource_tree(sections, workflow_unavailable=workflow_unavailable,
+                              show_live_status=live_status)
+    except Exception as e:
+        click.echo(f"Error: {str(e)}", err=True)
+        ctx.exit(ExitCode.FAILURE.value)
+
+
+def _assign_workflow_progress(sections, steps):
+    """Attach workflow step subtrees (list of Argo step dicts) to matching resource nodes."""
+    for section in sections:
+        for group in section.groups:
+            for resource in group.resources:
+                if resource.name in steps:
+                    resource.workflow_progress = steps[resource.name]
+                for child in resource.children:
+                    if child.name in steps:
+                        child.workflow_progress = steps[child.name]
+
+
+def _run_step_view(ctx, workflow_name, all_workflows, argo_server, namespace, insecure, token, show_all, live_status):
+    """Display the Argo workflow step tree view."""
     if all_workflows and ctx.get_parameter_source('workflow_name') != click.core.ParameterSource.DEFAULT:
         click.echo("Error: --workflow-name and --all-workflows are mutually exclusive", err=True)
         ctx.exit(ExitCode.FAILURE.value)
@@ -501,7 +578,10 @@ def status_command(ctx, workflow_name, all_workflows, argo_server, namespace, in
         if all_workflows:
             handler.handle_status_command(None, argo_server, namespace, insecure, show_all, live_status)
         else:
-            handler.handle_status_command(workflow_name, argo_server, namespace, insecure, show_all, live_status)
+            phase = handler.handle_status_command(
+                workflow_name, argo_server, namespace, insecure, show_all, live_status
+            )
+            hint_after_status(phase or '')
 
     except click.Abort:
         ctx.exit(ExitCode.FAILURE.value)

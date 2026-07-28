@@ -98,7 +98,7 @@ The individual child step names have stable roles:
 
 * **`tryApply`** — the actual root CR apply attempt
 * **`waitForFix`** — waits on the `ApprovalGate` when the apply failed and user action is required
-* **`patchApproval`** — patches the workflow UID approval annotation onto the target resource
+* **`patchApproval`** — patches the migration run approval annotation onto the target resource
 * **`resetGate`** — resets the gate back to `Pending` so it can be used again on the next retry
 * **`retryLoop`** — recursively re-enters the retry wrapper
 
@@ -138,6 +138,26 @@ The important distinction is stage, not whether the next operation happens in th
 * **later convergence steps** = perform the actual infrastructure work if the returned checksum says it is still needed
 * **final status patch** = record that the contract has now been successfully realized
 
+### Runtime gates and the `approve` CLI
+
+The `waitForFix` step blocks on a runtime `ApprovalGate` whose name ends in `.vapretry` (one per
+managed resource, e.g. `kafkacluster.my-cluster.vapretry`). The operator clears it through the
+`workflow approve` CLI, and the gate's subcategory — derived from the VAP denial message —
+selects the command:
+
+| Subcategory | When | Operator action | CLI |
+|---|---|---|---|
+| `change` | denial does **not** contain "Impossible" — a **Gated** field changed | Approve to let the workflow annotate the resource and retry the apply | `workflow approve change <resource>` |
+| `retry` | denial contains "Impossible" — an **Impossible** field changed | Manually reset the resource (e.g. delete & recreate), then approve to retry | `workflow approve retry <resource>` |
+
+`workflow approve change --list` / `--list` for retry enumerate the waiting runtime gates; the
+resource name is accepted with or without the `.vapretry` suffix. Approving a `change` gate
+drives the `patchApproval → resetGate → retryLoop` path above: the approval annotation
+(`migrations.opensearch.org/approved-during-run`) is written onto the resource, the gate is reset
+to `Pending`, and the apply is retried — this time accepted by the VAP. Step gates (the
+non-`.vapretry` milestone checkpoints) are described in
+[MigrationAsAWorkflow.md](MigrationAsAWorkflow.md#blocking-upon-user-approval).
+
 ---
 
 ## Field Classification
@@ -167,6 +187,17 @@ Kafka ──→ Proxy (CapturedTraffic) ──→ DataSnapshot ──→ Snapsho
 
 Each arrow represents a "waits for" relationship. Downstream waiters check a **per-dependency checksum** on the upstream resource — not a single monolithic hash.
 
+Separately from checksum propagation, each CR records its dependency-graph edges in
+`spec.dependsOn`. The `workflow reset` CLI reads `spec.dependsOn` off the live CRs to build a
+deletion DAG (see [WorkflowCrdDesign.md](WorkflowCrdDesign.md)). This field is written by the
+workflow's `tryApply` step — **not** the initializer — for every resource including the terminal
+`DataSnapshot` and `SnapshotMigration`. Writing it only from `tryApply` keeps `spec.dependsOn`
+reflecting the *established* graph: the initializer must not advertise an edge before the workflow
+has actually wired it up, or a mid-run reset could order deletions around a dependency that does
+not yet exist. For terminal resources the value is derived from the resolved dependency set
+(DataSnapshot: its proxy setups; SnapshotMigration: its DataSnapshot, or none for an
+externally-managed ES/OS snapshot).
+
 #### Schema annotations as the source of truth
 
 Checksum materiality and change restriction categories are encoded directly on the Zod schema using `.meta()`:
@@ -191,8 +222,13 @@ The `checksumFor` array names the downstream dependencies whose checksum include
 
 These annotations drive:
 1. **Config transformer** — computes per-dependency checksums by selecting only fields tagged for each dependency
-2. **Doc generation** — populates the checksum columns in the field classification tables
-3. **VAP generation** — (future) generates CEL expressions from the restriction categories
+2. **Resource projection** — maps user-facing fields into migration CR `.spec` fields
+3. **CRD/VAP generation** — emits generated CRDs and CEL policies from the same metadata
+4. **Resolved migration resources generation** — records the effective resource parameters and their policy metadata
+
+For the current implementation that connects these schema annotations to CRDs,
+VAPs, image staging, Helm installation, and resolved migration resources, see
+[resolvingMigrationParametersFromConfigs.md](resolvingMigrationParametersFromConfigs.md).
 
 #### Per-dependency checksums in CRD status
 
@@ -236,7 +272,8 @@ Downstream dependencies that consume the proxy's checksum:
 | `spec.resources` | Safe       | Resource limits/requests | Yes (rolling) | ❌ | ❌ |
 | `spec.internetFacing` | Impossible | Changes load balancer scheme; recreate Service | N/A | ❌ | ❌ |
 | `spec.loggingConfigurationOverrideConfigMap` | Safe       | Logging config swap | Yes (rolling) | ❌ | ❌ |
-| `spec.otelCollectorEndpoint` | Safe       | Observability config | Yes (rolling) | ❌ | ❌ |
+| `spec.otelTraceCollectorEndpoint` | Safe       | Trace export config | Yes (rolling) | ❌ | ❌ |
+| `spec.otelMetricsCollectorEndpoint` | Safe       | Metrics export config | Yes (rolling) | ❌ | ❌ |
 | `spec.setHeader` | Gated      | Header injection tweaks | Yes (rolling) | ✅ | ✅ |
 | `spec.destinationConnectionPoolSize` | Safe       | Connection tuning | Yes (rolling) | ❌ | ❌ |
 | `spec.destinationConnectionPoolTimeout` | Safe       | Connection tuning | Yes (rolling) | ❌ | ❌ |
@@ -270,7 +307,8 @@ The replayer has no downstream dependencies — nothing waits on it. The checksu
 | `spec.resources` | Safe | Resource limits/requests | Yes (rolling) | ❌ |
 | `spec.jvmArgs` | Safe | JVM tuning | Yes (rolling) | ❌ |
 | `spec.loggingConfigurationOverrideConfigMap` | Safe | Logging config swap | Yes (rolling) | ❌ |
-| `spec.otelCollectorEndpoint` | Safe | Observability config | Yes (rolling) | ❌ |
+| `spec.otelTraceCollectorEndpoint` | Safe | Trace export config | Yes (rolling) | ❌ |
+| `spec.otelMetricsCollectorEndpoint` | Safe | Metrics export config | Yes (rolling) | ❌ |
 | `spec.speedupFactor` | Safe | Replay rate tuning | Yes (rolling) | ❌ |
 | `spec.lookaheadTimeSeconds` | Safe | Buffer tuning | Yes (rolling) | ❌ |
 | `spec.maxConcurrentRequests` | Safe | Performance tuning | Yes (rolling) | ❌ |
@@ -287,6 +325,14 @@ This transitions to `Completed`.
 Lock-on-Complete freezes the entire spec once done.
 All fields here are impossible to edit.  If a user wanted to change a snapshot
 in-progress, they would need to delete the existing snapshot and redrive.
+
+Like the other root-CR reconciles, `reconcileDataSnapshotResource` implements the
+`tryApply → waitForFix → patchApproval → resetGate → retryLoop` recovery loop against a
+`datasnapshot.<name>.vapretry` `ApprovalGate`. DataSnapshot has no `gated` fields today, so
+this loop does not fire during normal reconfiguration; it is the recovery path for a
+VAP-rejected apply (for example, `lock-on-complete` rejecting a re-apply of a `Completed`
+CR after an in-place upgrade, or any future `gated` field). Without it a rejected apply
+would be a silent dead end.
 
 Downstream dependencies that consume the snapshot's checksum:
 - **SnapshotMigration** — waits for the snapshot to be Completed before running metadata migration and/or document backfill
@@ -324,7 +370,8 @@ in-progress, they would need to delete the existing snapshot and redrive.
 | `spec.documentBackfillConfig.initialLeaseDuration` | Gated      | | ❌ |
 | `spec.documentBackfillConfig.maxConnections` | Gated      | | ❌ |
 | `spec.documentBackfillConfig.maxShardSizeBytes` | Gated      | | ❌ |
-| `spec.documentBackfillConfig.otelCollectorEndpoint` | Safe       | | ❌ |
+| `spec.documentBackfillConfig.otelTraceCollectorEndpoint` | Safe       | Trace export config | ❌ |
+| `spec.documentBackfillConfig.otelMetricsCollectorEndpoint` | Safe       | Metrics export config | ❌ |
 | `spec.documentBackfillConfig.useTargetClusterForWorkCoordination` |  Safe          | | ❌ |
 | `spec.documentBackfillConfig.jvmArgs` |  Safe          | | ❌ |
 | `spec.documentBackfillConfig.loggingConfigurationOverrideConfigMap` |   Safe         | | ❌ |
@@ -389,20 +436,20 @@ If the workflow waited to update `spec` until after child convergence, the CR wo
 
 ---
 
-## The Workflow UID Approval Pattern
+## The Migration Run Number Approval Pattern
 
-We tie approvals directly to the specific Argo Workflow execution requesting the change.
+We tie approvals directly to the migration run number requesting the change.
 
 **The Flow:**
 
-1. **`tryApply`:** Argo attempts the update. The incoming manifest includes an Argo label: `workflows.argoproj.io/run-uid: {{workflow.uid}}`.
+1. **`tryApply`:** Argo attempts the update. The incoming manifest includes a migration label: `migrations.opensearch.org/run-number: {{workflow.parameters.migrationRunNumber}}`.
 2. **The Block:** The VAP sees a gated change, looks for a matching approval annotation, does not find it, and rejects the update.
 3. **`waitForFix`:** The workflow waits on the corresponding `ApprovalGate` resource instead of using an Argo suspend node.
 4. **`patchApproval`:** After the user approves the gate, the workflow patches the target resource:
-   `kubectl patch <resource> <name> --type=merge -p '{"metadata":{"annotations":{"migrations.opensearch.org/approved-by-run": "{{workflow.uid}}"}}}'`
+   `kubectl patch <resource> <name> --type=merge -p '{"metadata":{"annotations":{"migrations.opensearch.org/approved-during-run": "{{workflow.parameters.migrationRunNumber}}"}}}'`
 5. **`resetGate`:** The workflow sets the `ApprovalGate` phase back to `Pending`.
 6. **`retryLoop`:** The workflow loops back and attempts the exact same `kubectl apply`.
-7. **The Pass:** The VAP sees the gated change, and evaluates `object.metadata.annotations['...approved-by-run'] == object.metadata.labels['workflows.argoproj.io/run-uid']`. The change is allowed.
+7. **The Pass:** The VAP sees the gated change, and evaluates `object.metadata.annotations['...approved-during-run'] == object.metadata.labels['migrations.opensearch.org/run-number']`. The change is allowed.
 
 **CEL Implementation Example** *(abbreviated — full policy covers all Gated fields from the classification table)*:
 
@@ -413,11 +460,12 @@ validations:
       (object.spec.enableMSKAuth == oldObject.spec.enableMSKAuth &&
        object.spec.noCapture == oldObject.spec.noCapture) 
       ||
-      # Condition 2: Workflow UID matches the approval annotation
+      # Condition 2: migration run number matches the approval annotation
       (has(object.metadata.annotations) &&
-       has(object.metadata.annotations['migrations.opensearch.org/approved-by-run']) &&
-       has(object.metadata.labels['workflows.argoproj.io/run-uid']) &&
-       object.metadata.annotations['migrations.opensearch.org/approved-by-run'] == object.metadata.labels['workflows.argoproj.io/run-uid'])
+       'migrations.opensearch.org/approved-during-run' in object.metadata.annotations &&
+       has(object.metadata.labels) &&
+       'migrations.opensearch.org/run-number' in object.metadata.labels &&
+       object.metadata.annotations['migrations.opensearch.org/approved-during-run'] == object.metadata.labels['migrations.opensearch.org/run-number'])
     message: "Gated changes detected. Approve the corresponding ApprovalGate."
 
 ```
@@ -565,7 +613,12 @@ When adding a new migration component (e.g., a traffic replayer), follow this ch
 
 ### 1. Define the CRD
 
-Add to `migrationCrds.yaml`. Each resource is a single CRD with configuration in `.spec` and lifecycle in `.status.phase`. Choose the lifecycle type:
+Add the resource projection metadata in
+`packages/schemas/src/migrationResourceProjections.ts`. Generated CRDs are
+emitted by `packages/schemas/src/generateMigrationResources.ts` and staged into
+the migration-console image; they are not hand-maintained Helm templates.
+
+Each resource is a single CRD with configuration in `.spec` and lifecycle in `.status.phase`. Choose the lifecycle type:
 
 * **Long-lived** (proxy, replayer): phases `[Initialized, Running, Ready, Error]`
 * **Terminal** (snapshot, migration job): phases `[Initialized, Running, Completed, Error]`
@@ -587,14 +640,17 @@ For every spec field, decide:
 | Category | Meaning | VAP action |
 |----------|---------|------------|
 | **Impossible** | Cannot change without delete/recreate (e.g., listen port, index allowlist) | Hard block, no escape hatch |
-| **Gated** | Risky but allowed with explicit approval (e.g., auth mode, TLS config) | Block unless UID annotation matches |
+| **Gated** | Risky but allowed with explicit approval (e.g., auth mode, TLS config) | Block unless run approval annotation matches |
 | **Safe** | Low-risk, always allowed (e.g., replica count, logging config) | No VAP expression needed |
 
 For terminal resources, Lock-on-Complete overrides everything once `status.phase == Completed`.
 
 ### 4. Write the VAP
 
-Add a `ValidatingAdmissionPolicy` + `ValidatingAdmissionPolicyBinding` to `validatingAdmissionPolicies.yaml`.
+VAPs are generated from the same projection metadata used for CRD generation.
+Add or adjust `changeRestriction` metadata on the relevant Zod schema fields,
+and add internal projection metadata for fields that do not come from user
+schema blocks.
 
 Pattern for Impossible fields:
 ```yaml
@@ -604,23 +660,25 @@ Pattern for Impossible fields:
   message: "Impossible: fieldName cannot be changed. Delete and recreate."
 ```
 
-Pattern for Gated fields (all share a single UID check):
+Pattern for Gated fields (all share a single migration-run check):
 ```yaml
 - expression: |
     (field1 unchanged && field2 unchanged && ...)
     ||
     (has(object.metadata.annotations) &&
-     'migrations.opensearch.org/approved-by-run' in object.metadata.annotations &&
+     'migrations.opensearch.org/approved-during-run' in object.metadata.annotations &&
      has(object.metadata.labels) &&
-     'workflows.argoproj.io/run-uid' in object.metadata.labels &&
-     object.metadata.annotations['migrations.opensearch.org/approved-by-run'] ==
-       object.metadata.labels['workflows.argoproj.io/run-uid'])
+     'migrations.opensearch.org/run-number' in object.metadata.labels &&
+     object.metadata.annotations['migrations.opensearch.org/approved-during-run'] ==
+       object.metadata.labels['migrations.opensearch.org/run-number'])
   message: "Gated changes detected. Approve the corresponding ApprovalGate."
 ```
 
-Use `has()` on every field to handle CRD upgrades where the field didn't previously exist.
+Generated VAP expressions use `has()` on every field to handle CRD upgrades
+where the field did not previously exist.
 
-For terminal resources, also add them to the `lock-on-complete-policy` resource list.
+For terminal resources, set the resource lifecycle metadata so the generator
+includes the resource in `lock-on-complete-policy`.
 
 ### 5. Add initializer placeholder
 
@@ -640,7 +698,7 @@ function makeTrafficReplayManifest(config, name) {
         metadata: {
             name: name,
             labels: {
-                "workflows.argoproj.io/run-uid": makeStringTypeProxy(expr.getWorkflowValue("uid"))
+                "migrations.opensearch.org/run-number": "{{workflow.parameters.migrationRunNumber}}"
             }
         },
         spec: {
@@ -671,7 +729,7 @@ In `resourceManagement.ts`, define the waiter so it checks both:
 
 For external resources whose status we do not own, store the checksum in metadata annotations instead of status.
 
-The `run-uid` label is required for the Workflow UID Approval Pattern.
+The `run-number` label is required for the Migration Run Number Approval Pattern.
 
 ### 9. Add apply + retry templates
 
@@ -702,17 +760,18 @@ Create a test pod in `templates/tests/` modeled on `test-vap-kafka.yaml`. The te
 2. Apply a spec (should succeed on `Initialized`)
 3. Try an Impossible field change (should fail)
 4. Try a Gated field change without approval (should fail)
-5. Add matching UID label + annotation, retry the Gated change (should succeed)
-6. Try with mismatched UIDs (should fail)
+5. Add matching run label + approval annotation, retry the Gated change (should succeed)
+6. Try with mismatched run approval (should fail)
 7. For terminal resources: patch to `Completed`, try any spec change (should fail via Lock-on-Complete)
 
 ### File summary
 
 | File | What to add |
 |------|-------------|
-| `migrationCrds.yaml` | CRD with typed schema + status phases |
+| `packages/schemas/src/migrationResourceProjections.ts` | CRD spec projection and lifecycle metadata |
+| `packages/schemas/src/userSchemas.ts` | User-facing field `changeRestriction` / `checksumFor` metadata |
+| `packages/schemas/src/generateMigrationResources.ts` | Generator support if the new resource needs a new generated pattern |
 | `workflowRbac.yaml` | Resource + `/status` in deployer role |
-| `validatingAdmissionPolicies.yaml` | Policy + binding (Impossible, Gated, optionally Lock-on-Complete) |
 | `migrationInitializer.ts` | Placeholder creation |
 | `setup<Component>.ts` | Manifest builder + apply/retry/lifecycle templates |
 | `fullMigration.ts` | Call the lifecycle template |

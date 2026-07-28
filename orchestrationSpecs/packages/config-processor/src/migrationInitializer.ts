@@ -7,9 +7,12 @@ import {z} from "zod";
 import {stringify} from "yaml";
 import * as fs from "fs/promises";
 import * as path from "path";
-import {scrapeApprovals} from "./formatApprovals";
-import {setNamesInUserConfig} from "./migrationConfigTransformer";
 import { generateSemaphoreKey, resolveSerializeSnapshotCreation } from './semaphoreUtils';
+import { crdName } from './crdNaming';
+import {
+    buildResolvedMigrationResources,
+    ResolvedMigrationResources,
+} from "./resolvedMigrationResources";
 
 type WorkflowConfig = z.infer<typeof ARGO_MIGRATION_CONFIG_PRE_ENRICH>;
 type KafkaClusterConfig = NonNullable<WorkflowConfig["kafkaClusters"]>[number];
@@ -18,6 +21,11 @@ type SnapshotConfig = WorkflowConfig["snapshots"][number];
 type SnapshotItemConfig = SnapshotConfig["createSnapshotConfig"][number];
 type SnapshotMigrationConfig = WorkflowConfig["snapshotMigrations"][number];
 type ReplayConfig = WorkflowConfig["trafficReplays"][number];
+
+type MigrationRunOptions = {
+    runNumber: number;
+    timestamp?: Date;
+};
 
 // const a: KafkaClusterConfig = { vers };
 // const b: WorkflowConfig = { snapshotMigrations: [{ label: "" }] }
@@ -36,6 +44,7 @@ const CRD_KIND_TO_PLURAL: Record<string, string> = {
     CapturedTraffic: 'capturedtraffics',
     DataSnapshot: 'datasnapshots',
     KafkaCluster: 'kafkaclusters',
+    MigrationRun: 'migrationruns',
     SnapshotMigration: 'snapshotmigrations',
     TrafficReplay: 'trafficreplays',
 };
@@ -53,29 +62,50 @@ export class MigrationInitializer {
     /**
      * Generate output files including workflow config, approval ConfigMaps, and concurrency ConfigMaps with semaphores
      */
-    async generateOutputFiles(workflows: WorkflowConfig, outputDir: string, userConfig: any, workflowName?: string): Promise<void> {
-        const bundle = await this.generateMigrationBundle(userConfig, workflowName);
+    async generateOutputFiles(
+        workflows: WorkflowConfig,
+        outputDir: string,
+        userConfig: any,
+        workflowName: string | undefined,
+        migrationRunOptions: MigrationRunOptions,
+    ): Promise<void> {
+        const bundle = this.generateMigrationBundleFromWorkflowConfig(workflows, userConfig, workflowName, migrationRunOptions);
         await this.writeBundleToFiles(bundle, outputDir);
     }
 
     /**
      * Generate all migration artifacts from user config
      */
-    async generateMigrationBundle(userConfig: any, workflowName?: string) {
+    async generateMigrationBundle(userConfig: any, workflowName: string | undefined, migrationRunOptions: MigrationRunOptions) {
         // Transform user config to workflow config
         const workflows = await this.transformer.processFromObject(userConfig);
-        
-        // Generate ConfigMaps
-        const approvalConfigMaps = this.generateApprovalConfigMaps(userConfig);
+        return this.generateMigrationBundleFromWorkflowConfig(workflows, userConfig, workflowName, migrationRunOptions);
+    }
+
+    private generateMigrationBundleFromWorkflowConfig(
+        workflows: WorkflowConfig,
+        userConfig: any,
+        workflowName?: string,
+        migrationRunOptions?: MigrationRunOptions,
+    ) {
+        if (migrationRunOptions?.runNumber === undefined) {
+            throw new Error("Migration run number is required when generating migration resources.");
+        }
         const concurrencyConfigMaps = this.generateConcurrencyConfigMaps(userConfig);
-        const crdResources = this.generateCRDResources(workflows, workflowName);
+        const resolvedMigrationResources = buildResolvedMigrationResources(workflows, workflowName);
+        const customMigrationResources = this.generateCustomMigrationResources(
+            workflows,
+            workflowName,
+            resolvedMigrationResources,
+            migrationRunOptions
+        );
         const warnings = this.generateWarnings(workflows);
         
         return {
             workflows,
-            approvalConfigMaps,
+            resolvedMigrationResources,
             concurrencyConfigMaps,
-            crdResources,
+            customMigrationResources,
             warnings
         };
     }
@@ -89,16 +119,17 @@ export class MigrationInitializer {
         // 1. Write workflow configuration
         const workflowPath = path.join(outputDir, 'workflowMigration.config.yaml');
         await fs.writeFile(workflowPath, JSON.stringify(bundle.workflows, null, 2));
+        await fs.writeFile(
+            path.join(outputDir, 'resolvedMigrationResources.json'),
+            JSON.stringify(bundle.resolvedMigrationResources, null, 2)
+        );
 
         // 2. Write individual resource files and the handler script
         const resourcesDir = path.join(outputDir, 'resources');
         await fs.mkdir(resourcesDir, { recursive: true });
 
-        const allItems = bundle.crdResources.items || [];
-        const configMapItems = [
-            ...(bundle.approvalConfigMaps.items || []),
-            ...(bundle.concurrencyConfigMaps.items || []),
-        ];
+        const allItems = bundle.customMigrationResources.items || [];
+        const configMapItems = bundle.concurrencyConfigMaps.items || [];
 
         type ResourceEntry = {
             file: string;
@@ -249,36 +280,6 @@ export class MigrationInitializer {
         return `kubectl patch ${plural}/${item.metadata.name} --subresource=status --type=merge -p '${patch}'`;
     }
 
-    private generateApprovalConfigMaps(userConfig: any) {
-        if (!userConfig) {
-            return { 
-                apiVersion: 'v1',
-                kind: 'List',
-                items: [] 
-            };
-        }
-
-        const approvals = scrapeApprovals(setNamesInUserConfig(userConfig));
-        
-        return {
-            apiVersion: 'v1',
-            kind: 'List',
-            items: [{
-                apiVersion: 'v1',
-                kind: 'ConfigMap',
-                metadata: {
-                    name: 'approval-config',
-                    labels: {
-                        'workflows.argoproj.io/configmap-type': 'Parameter'
-                    }
-                },
-                data: {
-                    'autoApprove': JSON.stringify(approvals)
-                }
-            }]
-        };
-    }
-
     private generateConcurrencyConfigMaps(userConfig: any) {
         const semaphoreKeys = this.generateSemaphoreKeys(userConfig);
         const semaphoreData: Record<string, string> = {};
@@ -315,13 +316,91 @@ export class MigrationInitializer {
     static readonly OUTPUT_LABEL_MIGRATION = 'migrations.opensearch.org/from-snapshot-migration';
     static readonly OUTPUT_LABEL_TASK = 'migrations.opensearch.org/task';
     static readonly OUTPUT_LABEL_KAFKA_CLUSTER = 'migrations.opensearch.org/kafka-cluster';
+    static readonly WORKFLOW_NAME_LABEL = 'migrations.opensearch.org/workflow-name';
+    static readonly RUN_NUMBER_LABEL = 'migrations.opensearch.org/run-number';
+    static readonly RUN_YEAR_LABEL = 'migrations.opensearch.org/year';
+    static readonly RUN_MONTH_LABEL = 'migrations.opensearch.org/month';
+    static readonly RUN_WEEK_LABEL = 'migrations.opensearch.org/week';
     static readonly WORKFLOW_LABEL = 'workflows.argoproj.io/workflow';
     static readonly STRIMZI_CLUSTER_LABEL = 'strimzi.io/cluster';
     static readonly CRD_GROUP = 'migrations.opensearch.org';
     static readonly CRD_API_VERSION = `${MigrationInitializer.CRD_GROUP}/v1alpha1`;
 
     private makeCrdName(...labels: string[]): string {
-        return labels.join('-');
+        return crdName(...labels);
+    }
+
+    private sanitizeResourceName(value: string): string {
+        const sanitizedChars: string[] = [];
+        let previousWasReplacement = false;
+
+        for (const char of value.toLowerCase()) {
+            const code = char.charCodeAt(0);
+            const isAlphaNumeric =
+                (code >= 97 && code <= 122) ||
+                (code >= 48 && code <= 57);
+            const isAllowedPunctuation = char === '.' || char === '-';
+
+            if (isAlphaNumeric || isAllowedPunctuation) {
+                if (sanitizedChars.length === 0 && !isAlphaNumeric) {
+                    continue;
+                }
+                sanitizedChars.push(char);
+                previousWasReplacement = false;
+                continue;
+            }
+
+            if (sanitizedChars.length > 0 && !previousWasReplacement) {
+                sanitizedChars.push('-');
+                previousWasReplacement = true;
+            }
+        }
+
+        while (sanitizedChars.length > 0) {
+            const char = sanitizedChars[sanitizedChars.length - 1];
+            const code = char.charCodeAt(0);
+            const isAlphaNumeric =
+                (code >= 97 && code <= 122) ||
+                (code >= 48 && code <= 57);
+            if (isAlphaNumeric) {
+                break;
+            }
+            sanitizedChars.pop();
+        }
+
+        return sanitizedChars.join('') || 'migration';
+    }
+
+    private isoWeek(date: Date): string {
+        const utcDate = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+        const day = utcDate.getUTCDay() || 7;
+        utcDate.setUTCDate(utcDate.getUTCDate() + 4 - day);
+        const yearStart = new Date(Date.UTC(utcDate.getUTCFullYear(), 0, 1));
+        const week = Math.ceil((((utcDate.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+        return String(week).padStart(2, '0');
+    }
+
+    private migrationRunMetadata(options: MigrationRunOptions, workflowName?: string) {
+        const timestamp = options.timestamp ?? new Date();
+        const runNumber = options.runNumber;
+        const resolvedWorkflowName = workflowName ?? 'migration';
+        return {
+            workflowName: resolvedWorkflowName,
+            runNumber,
+            timestamp,
+            name: `${this.sanitizeResourceName(resolvedWorkflowName)}-run-${runNumber}`,
+            correlationLabels: {
+                [MigrationInitializer.WORKFLOW_NAME_LABEL]: resolvedWorkflowName,
+                [MigrationInitializer.RUN_NUMBER_LABEL]: String(runNumber),
+            },
+            labels: {
+                [MigrationInitializer.WORKFLOW_NAME_LABEL]: resolvedWorkflowName,
+                [MigrationInitializer.RUN_NUMBER_LABEL]: String(runNumber),
+                [MigrationInitializer.RUN_YEAR_LABEL]: String(timestamp.getUTCFullYear()),
+                [MigrationInitializer.RUN_MONTH_LABEL]: String(timestamp.getUTCMonth() + 1).padStart(2, '0'),
+                [MigrationInitializer.RUN_WEEK_LABEL]: this.isoWeek(timestamp),
+            }
+        };
     }
 
     private makeApprovalGateResource(nameParts: string[], labels?: Record<string, string>) {
@@ -333,18 +412,28 @@ export class MigrationInitializer {
                 ...(labels && Object.keys(labels).length > 0 && { labels }),
             },
             spec: {},
-            status: { phase: 'Initialized' }
+            status: { phase: 'Created' }
         };
     }
 
-    private generateCRDResources(workflows: WorkflowConfig, workflowName?: string) {
+    private generateCustomMigrationResources(
+        workflows: WorkflowConfig,
+        workflowName: string | undefined,
+        resolvedMigrationResources: ResolvedMigrationResources,
+        migrationRunOptions: MigrationRunOptions,
+    ) {
         const CRD_API_VERSION = MigrationInitializer.CRD_API_VERSION;
+        const migrationRun = this.migrationRunMetadata(migrationRunOptions, workflowName);
         const baseGateLabels: Record<string, string> = workflowName
-            ? { [MigrationInitializer.APPROVAL_GATE_LABEL_KEY]: workflowName }
-            : {};
-        const baseResourceLabels: Record<string, string> = workflowName
-            ? { [MigrationInitializer.WORKFLOW_LABEL]: workflowName }
-            : {};
+            ? {
+                [MigrationInitializer.APPROVAL_GATE_LABEL_KEY]: workflowName,
+                ...migrationRun.correlationLabels,
+            }
+            : migrationRun.correlationLabels;
+        const baseResourceLabels: Record<string, string> = {
+            ...(workflowName ? { [MigrationInitializer.WORKFLOW_LABEL]: workflowName } : {}),
+            ...migrationRun.correlationLabels,
+        };
         // Merge baseGateLabels with the per-gate context labels.
         const gateLabels = (extra: Record<string, string | undefined>) => {
             const merged: Record<string, string> = { ...baseGateLabels };
@@ -354,6 +443,49 @@ export class MigrationInitializer {
             return merged;
         };
         const items: any[] = [];
+        if (workflows.requireBeginApproval) {
+            items.push(this.makeApprovalGateResource(
+                ['begin'],
+                gateLabels({
+                    [MigrationInitializer.GATE_LABEL_RESOURCE_KIND]: 'MigrationRun',
+                    [MigrationInitializer.GATE_LABEL_RESOURCE_NAME]: migrationRun.name,
+                })
+            ));
+        }
+
+        items.push({
+            apiVersion: CRD_API_VERSION,
+            kind: 'MigrationRun',
+            metadata: {
+                name: migrationRun.name,
+                labels: {
+                    ...(workflowName ? { [MigrationInitializer.WORKFLOW_LABEL]: workflowName } : {}),
+                    ...migrationRun.labels,
+                },
+            },
+            spec: {
+                workflowName: migrationRun.workflowName,
+                runNumber: migrationRun.runNumber,
+                timestamp: migrationRun.timestamp.toISOString(),
+                resolvedConfig: resolvedMigrationResources,
+            },
+        });
+        const resourcesByKey = new Map(
+            resolvedMigrationResources.resources
+                .map(resource => [`${resource.kind}:${resource.name}`, resource])
+        );
+        const resourceFor = (kind: string, name: string) => resourcesByKey.get(`${kind}:${name}`);
+        const specFor = (kind: string, name: string) => resourceFor(kind, name)?.parameters ?? {};
+        // Terminal-resource bootstrap spec: strip dependsOn so the initializer never advertises a
+        // dependency-graph edge before the workflow has actually established it. workflow reset reads
+        // spec.dependsOn from live CRs; for DataSnapshot/SnapshotMigration the edge must reflect the
+        // established graph, so tryApply (which re-applies with the resolved dependsOn) is its sole
+        // writer. The four long-running resources keep their initializer-stamped dependsOn.
+        const bootstrapSpecWithoutDependsOn = (kind: string, name: string) => {
+            const {dependsOn: _dependsOn, ...rest} = specFor(kind, name) as Record<string, unknown>;
+            return rest;
+        };
+        const annotationsFor = (kind: string, name: string) => resourceFor(kind, name)?.annotations;
 
         // KafkaCluster resources from workflow-managed Kafka clusters
         for (const kafkaCluster of (workflows.kafkaClusters ?? []) as KafkaClusterConfig[]) {
@@ -367,8 +499,8 @@ export class MigrationInitializer {
                         [MigrationInitializer.STRIMZI_CLUSTER_LABEL]: kafkaCluster.name,
                     },
                 },
-                spec: {},
-                status: { phase: 'Initialized', configChecksum: '' }
+                spec: specFor('KafkaCluster', kafkaCluster.name),
+                status: { phase: 'Created', configChecksum: '' }
             });
 
             const kcLabels = gateLabels({
@@ -401,8 +533,8 @@ export class MigrationInitializer {
                         [MigrationInitializer.OUTPUT_LABEL_KAFKA_CLUSTER]: proxy.kafkaConfig.label,
                     }
                 },
-                spec: { dependsOn: [proxy.kafkaConfig.label] },
-                status: { phase: 'Initialized', configChecksum: '' }
+                spec: specFor('CapturedTraffic', topicCrName),
+                status: { phase: 'Created', configChecksum: '' }
             });
 
             // CaptureProxy: proxy deployment contract
@@ -415,13 +547,16 @@ export class MigrationInitializer {
                         ...baseResourceLabels,
                         ...(proxySource && { [MigrationInitializer.GATE_LABEL_SOURCE]: proxySource }),
                         [MigrationInitializer.OUTPUT_LABEL_TASK]: 'captureProxy',
-                    }
+                    },
+                    ...(annotationsFor('CaptureProxy', proxy.name) ?
+                        { annotations: annotationsFor('CaptureProxy', proxy.name) } :
+                        {}),
                 },
-                spec: { dependsOn: [topicCrName] },
-                status: { phase: 'Initialized', configChecksum: '' }
+                spec: specFor('CaptureProxy', proxy.name),
+                status: { phase: 'Created', configChecksum: '' }
             });
 
-            // VAP retry gates
+            // VAP retry gates (fire during reconcile steps, before proxy deployment)
             items.push(this.makeApprovalGateResource(
                 ['capturedtraffic', topicCrName, 'vapretry'],
                 gateLabels({
@@ -436,6 +571,47 @@ export class MigrationInitializer {
                     [MigrationInitializer.GATE_LABEL_RESOURCE_KIND]: 'CaptureProxy',
                     [MigrationInitializer.GATE_LABEL_RESOURCE_NAME]: proxy.name,
                     [MigrationInitializer.GATE_LABEL_SOURCE]: proxySource,
+                })
+            ));
+            // Step approval gate: fires after reconcile, before actual proxy deployment
+            items.push(this.makeApprovalGateResource(
+                ['captureproxysetup', proxy.name],
+                gateLabels({
+                    [MigrationInitializer.GATE_LABEL_RESOURCE_KIND]: 'CaptureProxy',
+                    [MigrationInitializer.GATE_LABEL_RESOURCE_NAME]: proxy.name,
+                    [MigrationInitializer.GATE_LABEL_SOURCE]: proxySource,
+                })
+            ));
+        }
+
+        // CapturedTraffic resources from s3TrafficLoaders (no CaptureProxy peer:
+        // the dump is the producer). The CRD is created up-front so the UID
+        // enrichment script can wire it as the kafka topic's owner.
+        for (const loader of (workflows.s3TrafficLoaders ?? []) as Array<{name: string; sourceLabel?: string; kafkaConfig: {label: string}; s3Uri: string}>) {
+            const topicCrName = loader.name + '-topic';
+            const loaderSource = loader.sourceLabel;
+
+            items.push({
+                apiVersion: CRD_API_VERSION,
+                kind: 'CapturedTraffic',
+                metadata: {
+                    name: topicCrName,
+                    labels: {
+                        ...baseResourceLabels,
+                        ...(loaderSource && { [MigrationInitializer.GATE_LABEL_SOURCE]: loaderSource }),
+                        [MigrationInitializer.OUTPUT_LABEL_KAFKA_CLUSTER]: loader.kafkaConfig.label,
+                    }
+                },
+                spec: specFor('CapturedTraffic', topicCrName),
+                status: { phase: 'Created', configChecksum: '' }
+            });
+
+            items.push(this.makeApprovalGateResource(
+                ['capturedtraffic', topicCrName, 'vapretry'],
+                gateLabels({
+                    [MigrationInitializer.GATE_LABEL_RESOURCE_KIND]: 'CapturedTraffic',
+                    [MigrationInitializer.GATE_LABEL_RESOURCE_NAME]: topicCrName,
+                    [MigrationInitializer.GATE_LABEL_SOURCE]: loaderSource,
                 })
             ));
         }
@@ -454,20 +630,29 @@ export class MigrationInitializer {
                             [MigrationInitializer.GATE_LABEL_SNAPSHOT]: item.label,
                         }
                     },
-                    spec: { dependsOn: (item.dependsOnProxySetups ?? []).map(dep => dep.name) },
-                    status: { phase: 'Initialized', configChecksum: '' }
+                    spec: bootstrapSpecWithoutDependsOn('DataSnapshot', this.makeCrdName(snapshot.sourceConfig.label, item.label)),
+                    status: { phase: 'Created', configChecksum: '' }
                 });
+
+                // VAP retry gate for the DataSnapshot CR reconcile, matching the other resources.
+                const dataSnapshotName = this.makeCrdName(snapshot.sourceConfig.label, item.label);
+                items.push(this.makeApprovalGateResource(
+                    ['datasnapshot', dataSnapshotName, 'vapretry'],
+                    gateLabels({
+                        [MigrationInitializer.GATE_LABEL_RESOURCE_KIND]: 'DataSnapshot',
+                        [MigrationInitializer.GATE_LABEL_RESOURCE_NAME]: dataSnapshotName,
+                        [MigrationInitializer.GATE_LABEL_SOURCE]: snapshot.sourceConfig.label,
+                        [MigrationInitializer.GATE_LABEL_SNAPSHOT]: item.label,
+                    })
+                ));
             }
         }
 
         // SnapshotMigration resources from snapshotMigrations
         for (const migration of (workflows.snapshotMigrations ?? []) as SnapshotMigrationConfig[]) {
-            const snapshotMigrationName = this.makeCrdName(
-                migration.sourceLabel,
-                migration.targetConfig.label,
-                migration.label,
-                migration.migrationLabel
-            );
+            // The transformer already computed and sanitized this name; reuse it so the
+            // CR name, the uid-map key, and the workflow's resourceName are guaranteed equal.
+            const snapshotMigrationName = migration.resourceName;
             items.push({
                 apiVersion: CRD_API_VERSION,
                 kind: 'SnapshotMigration',
@@ -481,9 +666,8 @@ export class MigrationInitializer {
                         [MigrationInitializer.OUTPUT_LABEL_MIGRATION]: migration.migrationLabel,
                     }
                 },
-                spec: {
-                },
-                status: { phase: 'Initialized', configChecksum: '' }
+                spec: bootstrapSpecWithoutDependsOn('SnapshotMigration', snapshotMigrationName),
+                status: { phase: 'Created', configChecksum: '' }
             });
 
             const migLabels = gateLabels({
@@ -495,7 +679,7 @@ export class MigrationInitializer {
                 [MigrationInitializer.GATE_LABEL_MIGRATION]: migration.migrationLabel,
             });
 
-            // VAP retry gate for the root SnapshotMigration CR reconcile
+            // VAP retry gate for the root SnapshotMigration CR reconcile (fires first, during reconcile step)
             items.push(this.makeApprovalGateResource(
                 ['snapshotmigration', snapshotMigrationName, 'vapretry'], migLabels));
 
@@ -506,10 +690,13 @@ export class MigrationInitializer {
                 migration.migrationLabel,
             ];
             const resourcePath = this.makeCrdName(...approvalNameParts);
+            // Step approval gates: ordered by workflow execution sequence (all inside migrateFromSnapshot)
             items.push(this.makeApprovalGateResource(
                 ['evaluatemetadata', resourcePath], migLabels));
             items.push(this.makeApprovalGateResource(
                 ['migratemetadata', resourcePath], migLabels));
+            items.push(this.makeApprovalGateResource(
+                ['documentbackfill', resourcePath], migLabels));
         }
 
         // TrafficReplay resources from trafficReplays
@@ -526,14 +713,8 @@ export class MigrationInitializer {
                         [MigrationInitializer.OUTPUT_LABEL_TASK]: 'trafficReplayer',
                     }
                 },
-                spec: {
-                    dependsOn: [
-                        replay.fromProxy,
-                        ...((replay.dependsOnSnapshotMigrations ?? []) as ReplayConfig["dependsOnSnapshotMigrations"]).map(dep =>
-                            this.makeCrdName(dep.source, replay.toTarget.label, dep.snapshot, dep.migrationLabel))
-                    ]
-                },
-                status: { phase: 'Initialized', configChecksum: '' }
+                spec: specFor('TrafficReplay', replay.name),
+                status: { phase: 'Created', configChecksum: '' }
             });
 
             // VAP retry gate for replay
@@ -569,8 +750,8 @@ export class MigrationInitializer {
         return warnings;
     }
 
-    generateApprovalGateCleanupScript(crdResources: { items: any[] }): string | null {
-        const gates = crdResources.items.filter((item: any) => item.kind === 'ApprovalGate');
+    generateApprovalGateCleanupScript(customMigrationResources: { items: any[] }): string | null {
+        const gates = customMigrationResources.items.filter((item: any) => item.kind === 'ApprovalGate');
         if (gates.length === 0) return null;
 
         const plural = `approvalgates.${MigrationInitializer.CRD_GROUP}`;
@@ -597,15 +778,15 @@ export class MigrationInitializer {
     private generateWorkflowUidEnrichmentScript(workflows: WorkflowConfig): string | null {
         const kafkaClusters = (workflows.kafkaClusters ?? []) as KafkaClusterConfig[];
         const proxies = workflows.proxies as ProxyConfig[];
+        const s3TrafficLoaders = (workflows.s3TrafficLoaders ?? []) as Array<{name: string}>;
         const snapshotMigrations = workflows.snapshotMigrations as SnapshotMigrationConfig[];
         const trafficReplays = workflows.trafficReplays as ReplayConfig[];
+        const dataSnapshotResources = ((workflows.snapshots ?? []) as SnapshotConfig[])
+            .flatMap(snapshot => (snapshot.createSnapshotConfig as SnapshotItemConfig[]).map(item => ({
+                name: this.makeCrdName(snapshot.sourceConfig.label, item.label),
+            })));
         const snapshotMigrationResources = snapshotMigrations.map(migration => ({
-            name: this.makeCrdName(
-                migration.sourceLabel,
-                migration.targetConfig.label,
-                migration.label,
-                migration.migrationLabel
-            )
+            name: migration.resourceName
         }));
         const shellVar = (prefix: string, name: string) =>
             `${prefix}_${name.replace(/[^A-Za-z0-9_]/g, "_")}`;
@@ -625,6 +806,21 @@ export class MigrationInitializer {
                     proxy.name,
                     shellVar('proxy', proxy.name)
                 )),
+            ...dataSnapshotResources.map(snapshot =>
+                kubectlGetUid(
+                    'datasnapshots.migrations.opensearch.org',
+                    snapshot.name,
+                    shellVar('data_snapshot', snapshot.name)
+                )),
+            // S3 traffic loaders own a CapturedTraffic CR named <name>-topic
+            // (the same naming convention proxies use); we need the CR's UID
+            // to set ownerReferences on the KafkaTopic / etc. created underneath.
+            ...s3TrafficLoaders.map(loader =>
+                kubectlGetUid(
+                    'capturedtraffics.migrations.opensearch.org',
+                    `${loader.name}-topic`,
+                    shellVar('s3loader', loader.name)
+                )),
             ...snapshotMigrationResources.map(migration =>
                 kubectlGetUid(
                     'snapshotmigrations.migrations.opensearch.org',
@@ -642,6 +838,10 @@ export class MigrationInitializer {
         const uidMapArgs = [
             ...kafkaClusters.map(cluster => `  --arg ${shellVar('kafka', cluster.name)} "$${shellVar('kafka', cluster.name)}"`),
             ...proxies.map(proxy => `  --arg ${shellVar('proxy', proxy.name)} "$${shellVar('proxy', proxy.name)}"`),
+            ...dataSnapshotResources.map(snapshot =>
+                `  --arg ${shellVar('data_snapshot', snapshot.name)} "$${shellVar('data_snapshot', snapshot.name)}"`
+            ),
+            ...s3TrafficLoaders.map(loader => `  --arg ${shellVar('s3loader', loader.name)} "$${shellVar('s3loader', loader.name)}"`),
             ...snapshotMigrationResources.map(migration =>
                 `  --arg ${shellVar('snapshot_migration', migration.name)} "$${shellVar('snapshot_migration', migration.name)}"`
             ),
@@ -660,6 +860,12 @@ export class MigrationInitializer {
             "    },",
             "    proxies: {",
             mapEntries(proxies, 'proxy'),
+            "    },",
+            "    dataSnapshots: {",
+            mapEntries(dataSnapshotResources, 'data_snapshot'),
+            "    },",
+            "    s3TrafficLoaders: {",
+            mapEntries(s3TrafficLoaders, 's3loader'),
             "    },",
             "    snapshotMigrations: {",
             mapEntries(snapshotMigrationResources, 'snapshot_migration'),
@@ -685,9 +891,12 @@ export class MigrationInitializer {
             "trap 'rm -f \"$tmp_file\"' EXIT",
             "",
             "jq --argjson uids \"$uid_map_json\" '",
+            "  def crdname(s): s | ascii_downcase | gsub(\"[^a-z0-9.-]+\"; \"-\") | gsub(\"-+\"; \"-\") | sub(\"^[-.]+\"; \"\") | sub(\"[-.]+$\"; \"\");",
             "  .kafkaClusters |= ((. // []) | map(. + {resourceUid: $uids.kafkaClusters[.name]}))",
             "  | .proxies |= ((. // []) | map(. + {resourceUid: $uids.proxies[.name]} | .kafkaConfig += {clusterResourceUid: $uids.kafkaClusters[.kafkaConfig.label]}))",
-            "  | .snapshotMigrations |= ((. // []) | map(. + {resourceUid: $uids.snapshotMigrations[(.sourceLabel + \"-\" + .targetConfig.label + \"-\" + .label + \"-\" + .migrationLabel)]}))",
+            "  | .snapshots |= ((. // []) | map(. as $snapshot | .createSnapshotConfig |= ((. // []) | map(. + {resourceUid: $uids.dataSnapshots[crdname($snapshot.sourceConfig.label + \"-\" + .label)]}))))",
+            "  | .s3TrafficLoaders |= ((. // []) | map(. + {resourceUid: $uids.s3TrafficLoaders[.name]} | .kafkaConfig += {clusterResourceUid: $uids.kafkaClusters[.kafkaConfig.label]}))",
+            "  | .snapshotMigrations |= ((. // []) | map(. + {resourceUid: $uids.snapshotMigrations[crdname(.sourceLabel + \"-\" + .targetConfig.label + \"-\" + .label + \"-\" + .migrationLabel)]}))",
             "  | .trafficReplays |= ((. // []) | map(. + {resourceUid: $uids.trafficReplays[.name]}))",
             "' \"$CONFIG_PATH\" > \"$tmp_file\"",
             "",
@@ -706,7 +915,11 @@ export class MigrationInitializer {
                 sourceVersion,
                 sourceCluster.snapshotInfo?.serializeSnapshotCreation
             );
-            for (const snapshotName of Object.keys(sourceCluster.snapshotInfo?.snapshots || {})) {
+            const snapshotNames = [
+                ...Object.keys(sourceCluster.snapshotInfo?.snapshots || {}),
+                ...Object.keys(sourceCluster.snapshotInfo?.backups || {}),
+            ];
+            for (const snapshotName of snapshotNames) {
                 const key = generateSemaphoreKey(serialize, sourceName, snapshotName);
                 if (!semaphoreKeys.includes(key)) {
                     semaphoreKeys.push(key);
