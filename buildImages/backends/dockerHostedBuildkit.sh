@@ -123,12 +123,13 @@ ensure_registry_container() {
 # registry port. No docker network connect is used: the registry is bound on
 # 0.0.0.0 so it is reachable at the node's default gateway IP (the host).
 #
-# Steps per node:
-#  1. Resolve the host gateway IP from inside the node (default route next-hop).
-#  2. Add an /etc/hosts entry mapping EXTERNAL_REGISTRY_NAME to that IP so
-#     containerd/cri-dockerd can resolve the name without Docker bridge DNS.
-#  3. Write a hosts.toml pointing containerd at http://<name>:EXTERNAL_REGISTRY_PORT
-#     so plain-HTTP pulls are accepted.
+# The hosts.toml is keyed on EXTERNAL_REGISTRY_NAME:EXTERNAL_REGISTRY_PORT so
+# image references like docker-registry:5001/foo:tag route through the mirror,
+# but the mirror's `server` URL uses the resolved host gateway IP directly.
+# We deliberately do NOT write /etc/hosts on the node: Docker regenerates that
+# file on every container start, so any entry added here disappears the next
+# time the node is stopped/started and pulls silently break. Encoding the IP
+# in hosts.toml (which lives on the node's own filesystem) survives restarts.
 #
 # Args: <cluster-docker-network> <node-container-name>...
 connect_cluster_to_registry_network() {
@@ -147,10 +148,13 @@ connect_cluster_to_registry_network() {
   local node host_gw
   for node in "${nodes[@]}"; do
     host_gw="$(docker exec "${node}" sh -c "ip route show default | awk '/default/ {print \$3}'")"
-    docker exec -i "${node}" sh -c "echo '${host_gw} ${EXTERNAL_REGISTRY_NAME}' >> /etc/hosts"
+    if [[ -z "${host_gw}" ]]; then
+      echo "Could not resolve host gateway IP from node '${node}'" >&2
+      return 1
+    fi
     docker exec "${node}" mkdir -p "${registry_dir}"
     cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${registry_dir}/hosts.toml"
-server = "http://${EXTERNAL_REGISTRY_NAME}:${EXTERNAL_REGISTRY_PORT}"
+server = "http://${host_gw}:${EXTERNAL_REGISTRY_PORT}"
 EOF
   done
 }
